@@ -58,6 +58,10 @@ select = ["E", "F", "I", "UP", "B", "S", "C4", "SIM"]
 # multipart/form-data and Problem Details responses are not SQL/shell contexts; S101 (assert) is fine in tests.
 ignore = []
 
+[tool.ruff.lint.isort]
+# every module gets lazy (string-free) type annotations without per-file quoting.
+required-imports = ["from __future__ import annotations"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]  # assert is the point of a test
 

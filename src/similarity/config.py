@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -24,7 +26,7 @@ class ApiSettings(SharedSettings):
     api_concurrency_limit: int = 200
 
     @model_validator(mode="after")
-    def _check_invariants(self) -> "ApiSettings":
+    def _check_invariants(self) -> ApiSettings:
         if self.max_doc_chars > self.max_file_size_bytes:
             raise ValueError("MAX_DOC_CHARS must be <= MAX_FILE_SIZE_BYTES")
         return self
@@ -42,7 +44,7 @@ class WorkerSettings(SharedSettings):
     metrics_port: int = 9_100
 
     @model_validator(mode="after")
-    def _check_invariants(self) -> "WorkerSettings":
+    def _check_invariants(self) -> WorkerSettings:
         if self.heartbeat_max_age_s <= 2 * self.read_block_ms / 1000:
             raise ValueError("HEARTBEAT_MAX_AGE_S must be > 2 * READ_BLOCK_MS / 1000")
         if self.max_attempts < 1:
