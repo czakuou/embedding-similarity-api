@@ -1,0 +1,75 @@
+[project]
+name = "similarity"
+version = "0.1.0"
+description = "Document Similarity Service: async API + worker computing sentence-embedding similarity"
+readme = "README.md"
+authors = [
+    { name = "Emil Krzaczynski", email = "emil.krzakuou@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.143.2",
+    "limits[redis]==5.7.0",
+    "prometheus-client>=0.26.0",
+    "prometheus-fastapi-instrumentator>=8.1.0",
+    "pydantic-settings>=2.16.0",
+    "python-multipart>=0.0.32",
+    "redis>=7.4.1",
+    "structlog>=26.1.0",
+    "uuid6>=2025.0.1",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.0",
+    "pip-audit>=2.10.1",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "ruff>=0.17.1",
+    "testcontainers[redis]>=4.15.0",
+]
+worker = [
+    "sentence-transformers>=6.1.0",
+    "torch>=2.14.1",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "C4", "SIM"]
+# multipart/form-data and Problem Details responses are not SQL/shell contexts; S101 (assert) is fine in tests.
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is the point of a test
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+# torch/sentence-transformers ship incomplete stubs; the boundary is isolated in encoder.py.
+[[tool.mypy.overrides]]
+module = ["sentence_transformers.*", "torch.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "behavior: business-scenario tests from BEHAVIOR.md (require Docker for testcontainers)",
+]
