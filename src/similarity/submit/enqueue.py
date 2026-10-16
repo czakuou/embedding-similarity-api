@@ -12,13 +12,19 @@ from limits.aio.strategies import FixedWindowRateLimiter
 from limits.storage import storage_from_string
 from uuid6 import uuid7
 
-from similarity.analysis import analysis_key, expires_at
+from similarity.analysis import (
+    AnalysisRecord,
+    Status,
+    analysis_key,
+    expires_at,
+    record_to_hash,
+    validate_client_id,
+)
 from similarity.config import ApiSettings
 from similarity.submit.outcomes import Accepted, Invalid, Outcome, QueueFull, RateLimited
 from similarity.submit.validation import (
     decode_document,
     pre_cut_document,
-    validate_client_id,
     validate_filename,
     validate_query,
 )
@@ -54,7 +60,9 @@ async def check_rate_limit(
 
 
 async def queue_depth(redis_client: redis.Redis, stream_key: str) -> int:
-    return await redis_client.xlen(stream_key)
+    # redis-py's stub returns Any here (its sync/async overloads share one signature).
+    result: int = await redis_client.xlen(stream_key)
+    return result
 
 
 async def enqueue(
@@ -73,19 +81,17 @@ async def enqueue(
     analysis_id = uuid7()
     created_at = datetime.now(UTC)
     expiry = expires_at(created_at, result_ttl_s)
+    record = AnalysisRecord(
+        id=str(analysis_id),
+        client_id=client_id,
+        status=Status.QUEUED,
+        created_at=created_at,
+        expires_at=expiry,
+        document_truncated=document_truncated,
+    )
 
     async with redis_client.pipeline(transaction=True) as pipe:
-        pipe.hset(
-            analysis_key(str(analysis_id)),
-            mapping={
-                "id": str(analysis_id),
-                "client_id": client_id,
-                "status": "queued",
-                "attempts": 0,
-                "created_at": created_at.isoformat(),
-                "document_truncated": int(document_truncated),
-            },
-        )
+        pipe.hset(analysis_key(str(analysis_id)), mapping=record_to_hash(record))
         pipe.expireat(analysis_key(str(analysis_id)), int(expiry.timestamp()))
         pipe.xadd(
             stream_key,

@@ -1,20 +1,12 @@
-"""Pure validation and pre-cut functions for the POST slice."""
+"""Pure validation and pre-cut functions for the POST slice.
+
+validate_client_id lives in analysis.py (shared kernel), not here: both this
+slice and results.py need the same X-Client-Id contract.
+"""
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-
-CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
-def validate_client_id(client_id: str | None) -> str | None:
-    """Returns the client id if valid, None otherwise."""
-    if client_id is None:
-        return None
-    if not CLIENT_ID_PATTERN.match(client_id):
-        return None
-    return client_id
 
 
 def validate_filename(filename: str | None) -> bool:

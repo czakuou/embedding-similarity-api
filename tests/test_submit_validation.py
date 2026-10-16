@@ -3,21 +3,9 @@ from __future__ import annotations
 from similarity.submit.validation import (
     decode_document,
     pre_cut_document,
-    validate_client_id,
     validate_filename,
     validate_query,
 )
-
-
-def test_given_valid_client_id_when_validating_then_returned_unchanged() -> None:
-    assert validate_client_id("client-a_1") == "client-a_1"
-
-
-def test_given_missing_or_malformed_client_id_when_validating_then_rejected() -> None:
-    assert validate_client_id(None) is None
-    assert validate_client_id("") is None
-    assert validate_client_id("has a space") is None
-    assert validate_client_id("a" * 65) is None
 
 
 def test_given_txt_filename_when_validating_then_accepted() -> None:

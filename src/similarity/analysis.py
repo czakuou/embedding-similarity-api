@@ -7,11 +7,26 @@ slices.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Literal
 from uuid import UUID
+
+CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def validate_client_id(client_id: str | None) -> str | None:
+    """Returns the client id if valid, None otherwise. Shared by submit.py and
+    results.py: both need the same `X-Client-Id` format contract (SPEC §4.1).
+    """
+    if client_id is None:
+        return None
+    if not CLIENT_ID_PATTERN.match(client_id):
+        return None
+    return client_id
 
 
 class Status(StrEnum):
@@ -98,6 +113,60 @@ class AnalysisRecord:
     result: list[float] | None = None
     document_truncated: bool | None = None
     error: AnalysisError | None = None
+
+
+def record_to_hash(record: AnalysisRecord) -> dict[str, str]:
+    """Redis hashes only store strings; this is the single place that encodes an
+    AnalysisRecord into one, so the API and worker never drift on field encoding.
+    """
+    fields: dict[str, str] = {
+        "id": record.id,
+        "client_id": record.client_id,
+        "status": record.status.value,
+        "created_at": record.created_at.isoformat(),
+        "expires_at": record.expires_at.isoformat(),
+        "attempts": str(record.attempts),
+    }
+    if record.updated_at is not None:
+        fields["updated_at"] = record.updated_at.isoformat()
+    if record.result is not None:
+        fields["result"] = json.dumps(record.result)
+    if record.document_truncated is not None:
+        fields["document_truncated"] = str(int(record.document_truncated))
+    if record.error is not None:
+        fields["error"] = json.dumps(
+            {
+                "code": record.error.code,
+                "message": record.error.message,
+                "attempts": record.error.attempts,
+            }
+        )
+    return fields
+
+
+def hash_to_record(fields: dict[str, str]) -> AnalysisRecord:
+    """Inverse of record_to_hash; raises KeyError/ValueError on a malformed hash,
+    which should never happen since both writers go through record_to_hash.
+    """
+    error: AnalysisError | None = None
+    if "error" in fields:
+        raw_error = json.loads(fields["error"])
+        error = AnalysisError(**raw_error)
+
+    return AnalysisRecord(
+        id=fields["id"],
+        client_id=fields["client_id"],
+        status=Status(fields["status"]),
+        created_at=datetime.fromisoformat(fields["created_at"]),
+        expires_at=datetime.fromisoformat(fields["expires_at"]),
+        attempts=int(fields["attempts"]),
+        updated_at=datetime.fromisoformat(fields["updated_at"]) if "updated_at" in fields else None,
+        result=json.loads(fields["result"]) if "result" in fields else None,
+        document_truncated=bool(int(fields["document_truncated"]))
+        if "document_truncated" in fields
+        else None,
+        error=error,
+    )
 
 
 # --- UUIDv7 / expiry math ----------------------------------------------------

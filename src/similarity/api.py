@@ -14,6 +14,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from similarity.config import ApiSettings
 from similarity.observability import configure_logging
+from similarity.results import router as results_router
 from similarity.submit import make_redis_storage, rate_limit_item
 from similarity.submit import router as submit_router
 
@@ -41,6 +42,7 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
     app.state.settings = settings
 
     app.include_router(submit_router)
+    app.include_router(results_router)
 
     @app.get("/health")
     async def health() -> JSONResponse:
