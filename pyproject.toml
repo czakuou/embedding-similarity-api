@@ -63,7 +63,7 @@ ignore = []
 required-imports = ["from __future__ import annotations"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]  # assert is the point of a test
+"tests/**" = ["S101", "S311"]  # assert is the point of a test; non-crypto random is fine for jitter tests
 
 [tool.mypy]
 python_version = "3.13"
@@ -71,6 +71,11 @@ strict = true
 # torch/sentence-transformers ship incomplete stubs; the boundary is isolated in encoder.py.
 [[tool.mypy.overrides]]
 module = ["sentence_transformers.*", "torch.*"]
+ignore_missing_imports = true
+
+# no published type stubs for this package.
+[[tool.mypy.overrides]]
+module = ["prometheus_fastapi_instrumentator.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -18,6 +18,8 @@ repos:
           - uuid6>=2025.0.1
           - limits==5.7.0
           - pytest>=9.1.1
+          - prometheus-fastapi-instrumentator>=8.1.0
+          - python-multipart>=0.0.32
         args: [--strict]
         exclude: ^scripts/benchmark\.py$
 
