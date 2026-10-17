@@ -1,9 +1,10 @@
 # Document Similarity Service: Behaviour Scenarios
 
 > Business processes of the service, written in Gherkin and implemented as plain `pytest` tests (no `pytest-bdd`).
-> Each scenario maps 1:1 to a test named `test_given_..._when_..._then_...` in `tests/behavior/`.
-> These scenarios describe observable business behaviour only; the exact status codes, header names, and field
-> names that realise each outcome are the API contract in [`SPEC.md`](SPEC.md) §4, not repeated here.
+> These are **integration tests**: each scenario maps 1:1 to a test named `test_given_..._when_..._then_...` in
+> `tests/behavior/`, run against the real model, a real Redis, and the real worker loop -- not test doubles.
+> They describe observable business behaviour only; the exact status codes, header names, and field names that
+> realise each outcome are the API contract in [`SPEC.md`](SPEC.md) §4, not repeated here.
 
 ## How these scenarios run
 
@@ -12,9 +13,9 @@
 | HTTP | FastAPI `TestClient` against the real app factory | Exercises routing, validation, Problem Details |
 | Redis | **Real Redis via testcontainers** (session-scoped, `FLUSHDB` between tests, `noeviction`) | Correctness relies on real Redis semantics (`MULTI`, consumer groups, `XAUTOCLAIM`, TTL) |
 | Worker | One iteration of the `worker.py` loop (`process_batch`) driven in-process | Deterministic: no background threads or sleeps in tests |
-| Model | **Fake encoder** implementing the `Encoder` Protocol from `encoder.py`: deterministic vectors from a text hash; a document containing `__POISON__` raises | Fast, no torch; the real model is covered by the benchmark |
+| Model | **The real pinned model** (`encoder.py`'s `SentenceTransformerEncoder`), loaded once per test session | These are integration tests: a fake would prove the plumbing works, not that the service works |
 | Time & randomness | Injected clock and RNG | Expiry and retry timing are testable without waiting |
-| Test overrides | Small rate limit, queue depth and visibility timeout per scenario | Scenarios run in milliseconds |
+| Test overrides | Small rate limit, queue depth and visibility timeout per scenario | Scenarios run in milliseconds, aside from the one real model call per analysis |
 
 ## Priorities
 
@@ -24,7 +25,7 @@
 | 2 | Invalid input is rejected before queueing | 1 | 🔴 Must |
 | 3 | One client cannot consume another client's capacity | 2 | 🔴 Must |
 | 4 | Full queue rejects new work, accepted work still completes | 2 | 🔴 Must |
-| 5 | A poisoned document fails alone, with a reason | 4 | 🔴 Must |
+| 5 | An analysis that can never succeed fails alone, with a reason | 4 | 🔴 Must |
 | 6 | Expired and unknown results | 5 | 🟡 Should |
 | 7 | Client deletes its result | 5 | 🟡 Should |
 | 8 | A crashed worker's work is completed by another | 4 | 🟢 Nice (first to cut) |
@@ -92,7 +93,7 @@ Feature: Asynchronous similarity analysis
     And a new submission is now accepted
 
   # 5 ── Must ──────────────────────────────────────────────────────────────
-  Scenario: A poisoned document fails alone and reports why
+  Scenario: An analysis that can never succeed fails alone and reports why
     Given a batch containing several analyses, one of which cannot ever be processed successfully
     When the worker processes the batch
     Then the healthy analyses complete successfully with a result
@@ -150,7 +151,7 @@ Feature: Asynchronous similarity analysis
 | 2 | `test_given_invalid_input_when_submitted_then_rejected_and_not_queued` (parametrised over the Examples table) |
 | 3 | `test_given_client_over_limit_when_submitting_then_429_and_other_client_unaffected` |
 | 4 | `test_given_full_queue_when_submitting_then_503_and_accepted_work_completes` |
-| 5 | `test_given_poisoned_document_in_batch_when_processed_then_only_it_fails_with_reason` |
+| 5 | `test_given_unprocessable_analysis_in_batch_when_processed_then_only_it_fails_with_reason` |
 | 6a | `test_given_expired_analysis_when_polled_then_410` |
 | 6b | `test_given_unknown_or_foreign_analysis_when_polled_then_404` |
 | 7a | `test_given_done_analysis_when_deleted_then_204_and_then_404` |

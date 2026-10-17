@@ -24,8 +24,8 @@ repos:
           - prometheus-fastapi-instrumentator==8.1.0
           - python-multipart==0.0.32
           - httpx==0.28.1
-        args: [--strict]
-        exclude: ^scripts/benchmark\.py$
+        args: [--strict, src/similarity, tests]
+        pass_filenames: false
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.24.3

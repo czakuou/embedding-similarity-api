@@ -13,12 +13,51 @@ from testcontainers.community.redis import RedisContainer
 from similarity.analysis import AnalysisRecord, analysis_key, hash_to_record
 from similarity.api import create_app
 from similarity.config import ApiSettings, WorkerSettings
+from similarity.encoder import Encoder, SentenceTransformerEncoder
 from similarity.worker.items import QueueItem
 from similarity.worker.loop import ensure_consumer_group, run_one_iteration
 
-from ..fake_encoder import FakeEncoder
-
 ApiSettingsFactory = Callable[..., ApiSettings]
+
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+
+@pytest.fixture(scope="session")
+def real_encoder() -> SentenceTransformerEncoder:
+    """The actual model, loaded once for the whole test session (BEHAVIOR.md
+    scenarios run against the real model now, not a fake -- loading it per
+    test would cost several seconds each).
+    """
+    encoder = SentenceTransformerEncoder(MODEL_NAME, MODEL_REVISION)
+    encoder.warm_up()
+    return encoder
+
+
+class FailingEncoderWrapper:
+    """Wraps the real encoder but simulates an infrastructure-level failure
+    (e.g. a request to the model that never completes) for exactly one test
+    analysis. The Encoder Protocol only ever sees text, not analysis_id, so
+    the test identifies "the analysis that will fail" by giving it a unique
+    document text known only to the test -- not because that text is
+    special to the model (it isn't: the real model has no notion of a
+    "poisoned" input). BEHAVIOR.md scenario 5 is a business scenario about
+    failure handling, not about any particular document content.
+    """
+
+    def __init__(self, inner: Encoder, failing_document_text: str) -> None:
+        self._inner = inner
+        self._failing_document_text = failing_document_text
+
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        if self._failing_document_text in texts:
+            raise RuntimeError("simulated infrastructure failure")
+        return self._inner.encode(texts)
+
+    def similarity_pairwise(
+        self, embeddings1: list[list[float]], embeddings2: list[list[float]]
+    ) -> list[float]:
+        return self._inner.similarity_pairwise(embeddings1, embeddings2)
 
 
 def submit_valid_document(client: TestClient, client_id: str) -> httpx.Response:
@@ -119,20 +158,21 @@ async def worker_redis(worker_settings: WorkerSettings) -> AsyncIterator[redis.R
 async def process_one_batch(
     worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
+    encoder: Encoder,
     *,
     consumer_name: str = "worker-test",
     force_reclaim: bool = False,
 ) -> list[QueueItem]:
     """Drives the worker exactly one iteration (BEHAVIOR.md: no background
     threads or sleeps) using the real consumer-group mechanics (XREADGROUP /
-    XAUTOCLAIM) against the same Redis the API wrote to, with a fake encoder.
+    XAUTOCLAIM) against the same Redis the API wrote to.
     """
     await ensure_consumer_group(
         worker_redis, worker_settings.stream_key, worker_settings.consumer_group
     )
     return await run_one_iteration(
         worker_redis,
-        FakeEncoder(),
+        encoder,
         worker_settings,
         consumer_name=consumer_name,
         force_reclaim=force_reclaim,

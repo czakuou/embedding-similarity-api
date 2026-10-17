@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from starlette import status
 
 from similarity.config import WorkerSettings
+from similarity.encoder import SentenceTransformerEncoder
 from similarity.worker.batch import increment_attempts
 from similarity.worker.loop import ensure_consumer_group, read_batch
 
@@ -20,6 +21,7 @@ async def test_given_crashed_worker_when_message_idle_then_reclaimed_and_complet
     app_client: TestClient,
     worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
+    real_encoder: SentenceTransformerEncoder,
 ) -> None:
     # worker_settings fixture sets visibility_timeout_s=1 (BEHAVIOR.md).
     response = submit_valid_document(app_client, "client-a")
@@ -45,7 +47,9 @@ async def test_given_crashed_worker_when_message_idle_then_reclaimed_and_complet
     await asyncio.sleep(1.1)  # real VISIBILITY_TIMEOUT_S=1 must actually elapse for XAUTOCLAIM
 
     # w2 reclaims the idle message and completes it.
-    await process_one_batch(worker_redis, worker_settings, consumer_name="w2", force_reclaim=True)
+    await process_one_batch(
+        worker_redis, worker_settings, real_encoder, consumer_name="w2", force_reclaim=True
+    )
 
     record = await get_record(worker_redis, analysis_id)
     assert record.status.value == "done"

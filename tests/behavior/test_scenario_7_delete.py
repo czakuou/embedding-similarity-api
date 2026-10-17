@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from starlette import status
 
 from similarity.config import WorkerSettings
+from similarity.encoder import SentenceTransformerEncoder
 
 from .conftest import process_one_batch, submit_valid_document
 
@@ -16,10 +17,11 @@ async def test_given_done_analysis_when_deleted_then_204_and_then_404(
     app_client: TestClient,
     worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
+    real_encoder: SentenceTransformerEncoder,
 ) -> None:
     response = submit_valid_document(app_client, "client-a")
     analysis_id = response.json()["id"]
-    await process_one_batch(worker_redis, worker_settings)
+    await process_one_batch(worker_redis, worker_settings, real_encoder)
     done = app_client.get(
         f"/v1/similarity-analyses/{analysis_id}", headers={"X-Client-Id": "client-a"}
     )

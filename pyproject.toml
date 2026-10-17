@@ -40,6 +40,12 @@ worker = [
     "torch>=2.14.1",
 ]
 
+[tool.uv]
+# worker (torch + sentence-transformers) is a default group, not opt-in: the
+# BDD suite in tests/behavior/ runs against the real model (not a fake), so a
+# plain `uv sync` / `uv run pytest` must always have it available.
+default-groups = ["dev", "worker"]
+
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", marker = "platform_system == 'Linux'" },
@@ -88,5 +94,5 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-    "behavior: business-scenario tests from BEHAVIOR.md (require Docker for testcontainers)",
+    "behavior: integration tests from BEHAVIOR.md (require Docker for testcontainers and the real model)",
 ]

@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from starlette import status
 
 from similarity.config import WorkerSettings
+from similarity.encoder import SentenceTransformerEncoder
 
 from .conftest import process_one_batch, submit_valid_document
 
@@ -16,6 +17,7 @@ async def test_given_full_queue_when_submitting_then_503_and_accepted_work_compl
     app_client: TestClient,
     worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
+    real_encoder: SentenceTransformerEncoder,
 ) -> None:
     # api_settings fixture sets max_queue_depth=3; different client ids avoid
     # tripping the (separately tested) per-client rate limit.
@@ -31,7 +33,7 @@ async def test_given_full_queue_when_submitting_then_503_and_accepted_work_compl
     assert 5 <= retry_after <= 10
     assert rejected.json()["code"] == "OVERLOADED"
 
-    await process_one_batch(worker_redis, worker_settings)
+    await process_one_batch(worker_redis, worker_settings, real_encoder)
 
     for i, analysis_id in enumerate(accepted_ids):
         poll = app_client.get(

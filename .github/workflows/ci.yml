@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  quality:
+    name: Quality gates (pre-commit, tests, audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Cache the pinned model
+        # BEHAVIOR.md's integration tests load the real model; cache it so CI
+        # doesn't re-download from Hugging Face on every run.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface
+          key: hf-model-all-MiniLM-L6-v2-1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+
+      - name: pre-commit (ruff, mypy, gitleaks, hadolint, misc hygiene)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+
+      - name: Unit + integration tests
+        # BEHAVIOR.md scenarios are integration tests against the real model
+        # and a real Redis (testcontainers). Ubuntu runners ship Docker, so
+        # they work without the Ryuk workaround this repo's README documents
+        # for colima-based local dev.
+        run: uv run pytest -v
+
+      - name: Export locked dependencies for audit
+        # pip-audit's --locked only understands PEP 751 pylock.toml, not uv's
+        # native uv.lock format (verified by running it directly against
+        # uv.lock, which fails with "no lockfiles found"); export first.
+        run: uv export --format requirements.txt --all-groups --no-emit-project -o requirements-audit.txt
+
+      - name: pip-audit
+        run: uv run pip-audit -r requirements-audit.txt
+
+  docker:
+    name: Build Docker images (api, worker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build api image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: api
+          push: false
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build worker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: worker
+          push: false
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
