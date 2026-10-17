@@ -7,14 +7,56 @@ services:
       --appendonly yes
       --appendfsync everysec
     ports:
-      - "6379:6379"
+      - "6379:6379" # host access for local debugging only; not needed in production
     volumes:
       - redis-data:/data
+    networks:
+      - api-redis
+      - worker-redis
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
+
+  api:
+    build:
+      context: .
+      target: api
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    networks:
+      - api-redis # to reach redis; never on worker-redis, so it can't reach the worker
+      - public # to be reachable by clients
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      target: worker
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      TORCH_NUM_THREADS: "2"
+      OMP_NUM_THREADS: "2"
+    networks:
+      - worker-redis # to reach redis; never on api-redis or public, so it's unreachable from either
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "2"
+
+networks:
+  api-redis: {}
+  worker-redis: {}
+  public: {}
 
 volumes:
   redis-data:
