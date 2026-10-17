@@ -46,7 +46,18 @@ def parse_xautoclaim_response(
 
 
 def should_give_up(attempts: int, max_attempts: int) -> bool:
-    """SPEC §5: a message reclaimed with attempts > MAX_ATTEMPTS fails without computing
-    (poison circuit breaker). Attempts is incremented before this check runs.
+    """Defensive check before even attempting computation: attempts has already
+    exceeded MAX_ATTEMPTS, so this item must have been redelivered after it
+    should already have failed. Normally is_last_attempt_failure catches this
+    earlier (SPEC §5 poison circuit breaker); this is the fallback.
     """
     return attempts > max_attempts
+
+
+def is_last_attempt_failure(attempts: int, max_attempts: int) -> bool:
+    """BEHAVIOR.md scenario 5: a document failing on every one of MAX_ATTEMPTS
+    attempts ends up `failed` with `attempts == MAX_ATTEMPTS` (not + 1). Called
+    only after a computation attempt has actually failed, so the item still
+    gets every one of its allotted attempts before giving up.
+    """
+    return attempts >= max_attempts

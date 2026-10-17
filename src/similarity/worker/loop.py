@@ -98,6 +98,59 @@ async def reclaim_idle(
     return parse_xautoclaim_response(response)
 
 
+async def run_one_iteration(
+    redis_client: redis.Redis,
+    encoder: Encoder,
+    settings: WorkerSettings,
+    *,
+    consumer_name: str,
+    force_reclaim: bool = False,
+) -> list[QueueItem]:
+    """One pass of the consumer loop body: read, maybe reclaim, process, observe.
+
+    Pulled out of run() so BEHAVIOR.md scenarios can drive the worker
+    deterministically -- no background threads or sleeps (SPEC §13) -- by
+    calling this once per expected batch instead of running the real loop.
+    Returns the items processed, so a test can assert on batch composition.
+    """
+    items = await read_batch(
+        redis_client,
+        stream_key=settings.stream_key,
+        consumer_group=settings.consumer_group,
+        consumer_name=consumer_name,
+        batch_max_size=settings.batch_max_size,
+        read_block_ms=settings.read_block_ms,
+    )
+
+    if force_reclaim:
+        items += await reclaim_idle(
+            redis_client,
+            stream_key=settings.stream_key,
+            consumer_group=settings.consumer_group,
+            consumer_name=consumer_name,
+            visibility_timeout_s=settings.visibility_timeout_s,
+            batch_max_size=settings.batch_max_size,
+        )
+
+    if items:
+        inference_batch_size.observe(len(items))
+        batch_started = time.monotonic()
+        await process_batch(
+            redis_client,
+            encoder,
+            items,
+            stream_key=settings.stream_key,
+            consumer_group=settings.consumer_group,
+            max_attempts=settings.max_attempts,
+            now=datetime.now(UTC),
+        )
+        inference_batch_duration_seconds.observe(time.monotonic() - batch_started)
+        logger.info("batch.processed", batch_size=len(items))
+
+    await observe_queue_metrics(redis_client, settings.stream_key)
+    return items
+
+
 async def run(
     redis_client: redis.Redis,
     encoder: Encoder,
@@ -111,42 +164,16 @@ async def run(
 
     last_reclaim = time.monotonic()
     while not shutdown_event.is_set():
-        items = await read_batch(
-            redis_client,
-            stream_key=settings.stream_key,
-            consumer_group=settings.consumer_group,
-            consumer_name=consumer_name,
-            batch_max_size=settings.batch_max_size,
-            read_block_ms=settings.read_block_ms,
-        )
-
-        if time.monotonic() - last_reclaim >= settings.reclaim_interval_s:
-            items += await reclaim_idle(
-                redis_client,
-                stream_key=settings.stream_key,
-                consumer_group=settings.consumer_group,
-                consumer_name=consumer_name,
-                visibility_timeout_s=settings.visibility_timeout_s,
-                batch_max_size=settings.batch_max_size,
-            )
+        force_reclaim = time.monotonic() - last_reclaim >= settings.reclaim_interval_s
+        if force_reclaim:
             last_reclaim = time.monotonic()
-
-        if items:
-            inference_batch_size.observe(len(items))
-            batch_started = time.monotonic()
-            await process_batch(
-                redis_client,
-                encoder,
-                items,
-                stream_key=settings.stream_key,
-                consumer_group=settings.consumer_group,
-                max_attempts=settings.max_attempts,
-                now=datetime.now(UTC),
-            )
-            inference_batch_duration_seconds.observe(time.monotonic() - batch_started)
-            logger.info("batch.processed", batch_size=len(items))
-
-        await observe_queue_metrics(redis_client, settings.stream_key)
+        await run_one_iteration(
+            redis_client,
+            encoder,
+            settings,
+            consumer_name=consumer_name,
+            force_reclaim=force_reclaim,
+        )
         write_heartbeat(settings.heartbeat_path)
 
 

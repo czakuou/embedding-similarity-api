@@ -28,7 +28,7 @@ from similarity.observability import (
     analysis_retries_total,
     documents_truncated_total,
 )
-from similarity.worker.items import QueueItem, should_give_up
+from similarity.worker.items import QueueItem, is_last_attempt_failure, should_give_up
 
 logger = structlog.get_logger()
 
@@ -172,6 +172,7 @@ async def process_item_alone(
     *,
     record: AnalysisRecord,
     attempts: int,
+    max_attempts: int,
     stream_key: str,
     consumer_group: str,
     now: datetime,
@@ -182,8 +183,18 @@ async def process_item_alone(
     try:
         result = await compute_one(encoder, item)
     except Exception:
-        logger.exception("analysis.failed", analysis_id=item.analysis_id, attempts=attempts)
-        return  # left unacked: XAUTOCLAIM will redeliver it later
+        logger.exception("analysis.compute_failed", analysis_id=item.analysis_id, attempts=attempts)
+        if is_last_attempt_failure(attempts, max_attempts):
+            await give_up_on_item(
+                redis_client,
+                item,
+                record=record,
+                attempts=attempts,
+                stream_key=stream_key,
+                consumer_group=consumer_group,
+                now=now,
+            )
+        return  # otherwise left unacked: XAUTOCLAIM will redeliver it later
 
     updated = done_record(record, result=result, attempts=attempts, now=now)
     await write_and_ack(
@@ -253,6 +264,7 @@ async def process_batch(
                 item,
                 record=record,
                 attempts=attempts,
+                max_attempts=max_attempts,
                 stream_key=stream_key,
                 consumer_group=consumer_group,
                 now=now,

@@ -565,12 +565,9 @@ Estimates assume implementation with a coding agent **including reading and unde
 | 6 | BDD tests from `BEHAVIOR.md` (scenarios 1–7) | 25 | All behaviour tests green | Fake encoder via the `Encoder` Protocol; why real Redis |
 | 7 | `benchmark.py` + `scripts/benchmark.sh` + replica table | 15 | `T`, p95 batch, recommended config printed | Utilisation 0.7; what is measured vs assumed |
 | 8 | CI workflow | 10 | Green pipeline | CI = pre-commit + tests + audit + build |
-| 9 | README (from this SPEC): run, architecture, trade-offs, ADR-001, known limitations, "What I'd cut in 2 h", "How this was built", TODO | 20 | Reviewer can run and understand | Every "why" sentence |
+| 9 | README (from this SPEC): run, architecture, trade-offs, ADR-001, known limitations, "How this was built", TODO | 20 | Reviewer can run and understand | Every "why" sentence |
 | | **Total** | **230** | | |
 
-### What I would cut with only 2 hours
-
-Keep: API contract, worker split, Redis queue with acks, greedy batching, backpressure (`429`/`503`), metrics on queue depth/age, Dockerfile. Cut: `DELETE`, BDD layer (keep a handful of unit tests), benchmark script (keep the formula with assumptions), CI and most quality gates (keep ruff), graceful shutdown.
 
 ### README must also contain
 

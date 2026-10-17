@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import cast
 from uuid import UUID
 
@@ -22,7 +22,7 @@ from similarity.analysis import (
     validate_client_id,
 )
 from similarity.api_paths import SIMILARITY_ANALYSIS_ITEM_ROUTE, analysis_url
-from similarity.dependencies import RedisDep, SettingsDep
+from similarity.dependencies import ClockDep, RedisDep, SettingsDep
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +153,7 @@ async def get_analysis(
     analysis_id: UUID,
     settings: SettingsDep,
     redis_client: RedisDep,
+    clock: ClockDep,
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> JSONResponse:
     validated_client_id = validate_client_id(x_client_id)
@@ -165,7 +166,7 @@ async def get_analysis(
         analysis_id=analysis_id,
         client_id=validated_client_id,
         result_ttl_s=settings.result_ttl_s,
-        now=datetime.now(UTC),
+        now=clock(),
     )
 
     match outcome:
@@ -189,6 +190,7 @@ async def delete_analysis(
     analysis_id: UUID,
     settings: SettingsDep,
     redis_client: RedisDep,
+    clock: ClockDep,
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> JSONResponse:
     validated_client_id = validate_client_id(x_client_id)
@@ -201,7 +203,7 @@ async def delete_analysis(
         analysis_id=analysis_id,
         client_id=validated_client_id,
         result_ttl_s=settings.result_ttl_s,
-        now=datetime.now(UTC),
+        now=clock(),
     )
 
     match outcome:

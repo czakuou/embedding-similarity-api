@@ -2,7 +2,8 @@
 
 > Business processes of the service, written in Gherkin and implemented as plain `pytest` tests (no `pytest-bdd`).
 > Each scenario maps 1:1 to a test named `test_given_..._when_..._then_...` in `tests/behavior/`.
-> Design context: [`SPEC.md`](SPEC.md).
+> These scenarios describe observable business behaviour only; the exact status codes, header names, and field
+> names that realise each outcome are the API contract in [`SPEC.md`](SPEC.md) §4, not repeated here.
 
 ## How these scenarios run
 
@@ -12,8 +13,8 @@
 | Redis | **Real Redis via testcontainers** (session-scoped, `FLUSHDB` between tests, `noeviction`) | Correctness relies on real Redis semantics (`MULTI`, consumer groups, `XAUTOCLAIM`, TTL) |
 | Worker | One iteration of the `worker.py` loop (`process_batch`) driven in-process | Deterministic: no background threads or sleeps in tests |
 | Model | **Fake encoder** implementing the `Encoder` Protocol from `encoder.py`: deterministic vectors from a text hash; a document containing `__POISON__` raises | Fast, no torch; the real model is covered by the benchmark |
-| Time & randomness | Injected clock and RNG | Expiry (`410`) and jitter (`Retry-After`) are testable without waiting |
-| Test overrides | Small `RATE_LIMIT`, `MAX_QUEUE_DEPTH`, `VISIBILITY_TIMEOUT_S` per scenario | Scenarios run in milliseconds |
+| Time & randomness | Injected clock and RNG | Expiry and retry timing are testable without waiting |
+| Test overrides | Small rate limit, queue depth and visibility timeout per scenario | Scenarios run in milliseconds |
 
 ## Priorities
 
@@ -40,112 +41,103 @@ Feature: Asynchronous similarity analysis
 
   Background:
     Given the service is running
-    And client "client-a" is identified by the "X-Client-Id" header
+    And client "client-a" is identified to the service
 
   # 1 ── Must ──────────────────────────────────────────────────────────────
   Scenario: Client submits a document and receives the similarity result
-    Given a UTF-8 file "fox.txt" containing "The quick brown fox jumps over the lazy dog."
-    When "client-a" submits the file with the query "fox over dog"
-    Then the response status is 202
-    And the response has a "Location" header pointing to the analysis
-    And the response has a "Retry-After" header
-    And the body contains an "id", status "queued" and an "expires_at" 24 hours after "created_at"
+    Given a valid text document containing "The quick brown fox jumps over the lazy dog."
+    When "client-a" submits the document with the query "fox over dog"
+    Then the submission is accepted for later processing
+    And the client is told where to check on it and how long to wait before doing so
+    And the client is told the submission will remain valid for 24 hours
     When the worker processes the queue
-    And "client-a" polls the analysis
-    Then the response status is 200
-    And the status is "done"
-    And the result is a list with exactly one float between -1 and 1
-    And "document_truncated" is false
+    And "client-a" checks on the analysis
+    Then the analysis is complete
+    And a single similarity score is returned, between -1 and 1
+    And the client is told whether the document had to be shortened to fit the model
 
   # 2 ── Must ──────────────────────────────────────────────────────────────
   Scenario Outline: Invalid input is rejected and nothing is queued
     Given <file>
     When "client-a" submits it with the query <query>
-    Then the response status is <status>
-    And the body is a Problem Details document with code "<code>"
-    And the queue depth is unchanged
+    Then the submission is rejected with a reason the client can act on
+    And no work is queued because of it
 
     Examples:
-      | file                                     | query           | status | code                   |
-      | a file "data.csv" with valid UTF-8 text  | "fox over dog"  | 415    | UNSUPPORTED_MEDIA_TYPE |
-      | a "doc.txt" file larger than the limit   | "fox over dog"  | 413    | PAYLOAD_TOO_LARGE      |
-      | a "doc.txt" file with invalid UTF-8      | "fox over dog"  | 422    | VALIDATION_ERROR       |
-      | an empty "doc.txt" file                  | "fox over dog"  | 422    | VALIDATION_ERROR       |
-      | a valid "doc.txt" file                   | ""              | 422    | VALIDATION_ERROR       |
-      | a valid "doc.txt" file                   | 1001 characters | 422    | VALIDATION_ERROR       |
+      | file                                       | query           | reason                                   |
+      | a file that is not a text document         | "fox over dog"  | the file type is not supported           |
+      | a text document larger than the size limit | "fox over dog"  | the file is too large                    |
+      | a text document that is not valid UTF-8    | "fox over dog"  | the content could not be validated       |
+      | an empty text document                     | "fox over dog"  | the content could not be validated       |
+      | a valid text document                      | ""              | the content could not be validated       |
+      | a valid text document                      | 1001 characters | the content could not be validated       |
 
   # 3 ── Must ──────────────────────────────────────────────────────────────
   Scenario: One client cannot consume another client's capacity
-    Given the per-client rate limit is 20 requests per second
-    And "client-a" has submitted 20 valid analyses within the current second
-    When "client-a" submits a 21st analysis in the same second
-    Then the response status is 429
-    And the response has a "Retry-After" header between the base and twice the base
-    And the body is a Problem Details document with code "RATE_LIMITED"
-    When "client-b" submits a valid analysis in the same second
-    Then the response status is 202
+    Given "client-a" has already used up its fair share of capacity for the current window
+    When "client-a" submits another analysis in that same window
+    Then the submission is rejected as too frequent
+    And the client is told how long to wait before trying again
+    When "client-b" submits a valid analysis in that same window
+    Then the submission is accepted for later processing
 
   # 4 ── Must ──────────────────────────────────────────────────────────────
   Scenario: A full queue rejects new work but accepted work still completes
-    Given the maximum queue depth is 3
-    And 3 analyses have been accepted and are waiting in the queue
+    Given the service is at its capacity limit for waiting work
     When a client submits another valid analysis
-    Then the response status is 503
-    And the response has a "Retry-After" header between the base and twice the base
-    And the body is a Problem Details document with code "OVERLOADED"
+    Then the submission is rejected as the service being busy
+    And the client is told how long to wait before trying again
     When the worker processes the queue
-    Then all 3 previously accepted analyses have status "done"
-    And a new submission is accepted with status 202
+    Then all previously accepted analyses have completed
+    And a new submission is now accepted
 
   # 5 ── Must ──────────────────────────────────────────────────────────────
   Scenario: A poisoned document fails alone and reports why
-    Given the maximum number of attempts is 3
-    And 4 analyses are queued in one batch, one of which contains "__POISON__"
+    Given a batch containing several analyses, one of which cannot ever be processed successfully
     When the worker processes the batch
-    Then the 3 healthy analyses have status "done" with a result
-    And the poisoned analysis has status "processing" with 1 attempt
-    When the poisoned message is reclaimed and processed until attempts are exhausted
-    Then the poisoned analysis has status "failed"
-    And its error has code "PROCESSING_FAILED" and "attempts" equal to 3
-    And the error message contains no stack trace
-    And the message is no longer in the queue
+    Then the healthy analyses complete successfully with a result
+    And the unprocessable analysis is still being retried, with one attempt recorded so far
+    When the unprocessable analysis has been retried as many times as the service allows
+    Then that analysis is marked as permanently failed
+    And the client is given a reason for the failure, with the number of attempts made
+    And the failure reason contains no internal technical detail
+    And the failed analysis is no longer occupying space in the queue
 
   # 6 ── Should ────────────────────────────────────────────────────────────
   Scenario: An expired result is reported as gone
-    Given "client-a" received a "done" analysis
-    When 24 hours and 1 second have passed
-    And "client-a" polls the analysis
-    Then the response status is 410
+    Given "client-a" received a completed analysis
+    When the result's retention period has passed
+    And "client-a" checks on the analysis
+    Then the client is told the result is gone, not simply missing
 
   Scenario: An unknown or foreign analysis is not found
-    When "client-a" polls an analysis id that was never created
-    Then the response status is 404
-    Given "client-b" owns a "done" analysis
-    When "client-a" polls that analysis
-    Then the response status is 404
+    When "client-a" checks on an analysis that was never submitted
+    Then the client is told it does not exist
+    Given "client-b" owns a completed analysis
+    When "client-a" checks on that analysis
+    Then "client-a" is told it does not exist, with no indication that it belongs to someone else
 
   # 7 ── Should ────────────────────────────────────────────────────────────
   Scenario: Client deletes a finished result
-    Given "client-a" owns a "done" analysis
+    Given "client-a" owns a completed analysis
     When "client-a" deletes the analysis
-    Then the response status is 204
-    When "client-a" polls the analysis
-    Then the response status is 404
+    Then the deletion succeeds
+    When "client-a" checks on the analysis
+    Then the client is told it does not exist
 
   Scenario: Client cannot delete an analysis that is still in progress
-    Given "client-a" owns a "queued" analysis
+    Given "client-a" owns an analysis that is still waiting to be processed
     When "client-a" deletes the analysis
-    Then the response status is 409
-    And the analysis still exists with status "queued"
+    Then the deletion is refused because the work is still in progress
+    And the analysis still exists, still waiting to be processed
 
   # 8 ── Nice ──────────────────────────────────────────────────────────────
   Scenario: Work of a crashed worker is completed by another worker
-    Given the visibility timeout is 1 second
-    And worker "w1" has received an analysis but crashed before acknowledging it
-    When more than 1 second has passed
-    And worker "w2" reclaims idle messages and processes them
-    Then the analysis has status "done"
-    And its "attempts" is 2
+    Given one worker has picked up an analysis but crashed before finishing it
+    When enough time has passed that the work is considered abandoned
+    And another worker picks up the abandoned work
+    Then the analysis completes successfully
+    And the record reflects that it took a second attempt to complete
 ```
 
 ---
@@ -164,3 +156,6 @@ Feature: Asynchronous similarity analysis
 | 7a | `test_given_done_analysis_when_deleted_then_204_and_then_404` |
 | 7b | `test_given_in_progress_analysis_when_deleted_then_409` |
 | 8 | `test_given_crashed_worker_when_message_idle_then_reclaimed_and_completed` |
+
+> Test function names keep the concrete status codes (e.g. `429`, `503`) because they are code, not business
+> narrative; the exact mapping from each scenario's outcome to a status code lives in SPEC.md §4.
