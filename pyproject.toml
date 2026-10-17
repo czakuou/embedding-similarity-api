@@ -31,6 +31,7 @@ dev = [
     "pip-audit>=2.10.1",
     "pre-commit>=4.7.0",
     "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
     "ruff>=0.17.1",
     "testcontainers[redis]>=4.15.0",
 ]
@@ -68,9 +69,10 @@ required-imports = ["from __future__ import annotations"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-# torch/sentence-transformers ship incomplete stubs; the boundary is isolated in encoder.py.
+# torch/sentence-transformers/numpy are worker-only deps, not installed when
+# type-checking the API image's dependency set; the boundary is isolated in encoder.py.
 [[tool.mypy.overrides]]
-module = ["sentence_transformers.*", "torch.*"]
+module = ["sentence_transformers.*", "torch.*", "numpy.*"]
 ignore_missing_imports = true
 
 # no published type stubs for this package.
@@ -78,7 +80,13 @@ ignore_missing_imports = true
 module = ["prometheus_fastapi_instrumentator.*"]
 ignore_missing_imports = true
 
+# no published type stubs for this package.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 markers = [
     "behavior: business-scenario tests from BEHAVIOR.md (require Docker for testcontainers)",
 ]

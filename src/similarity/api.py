@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
 from contextlib import asynccontextmanager
+from typing import cast
 
 import redis.asyncio as redis
 import structlog
@@ -11,8 +12,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from limits.aio.strategies import FixedWindowRateLimiter
 from prometheus_fastapi_instrumentator import Instrumentator
+from starlette import status
 
 from similarity.config import ApiSettings
+from similarity.dependencies import RedisDep
 from similarity.observability import configure_logging
 from similarity.results import router as results_router
 from similarity.submit import make_redis_storage, rate_limit_item
@@ -46,15 +49,18 @@ def create_app(settings: ApiSettings | None = None) -> FastAPI:
 
     @app.get("/health")
     async def health() -> JSONResponse:
-        return JSONResponse(status_code=200, content={"status": "ok"})
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ok"})
 
     @app.get("/ready")
-    async def ready() -> JSONResponse:
+    async def ready(redis_client: RedisDep) -> JSONResponse:
         try:
-            await app.state.redis.ping()
+            # redis-py's stub shares one signature between the sync and async clients.
+            await cast("Awaitable[bool]", redis_client.ping())
         except redis.RedisError:
-            return JSONResponse(status_code=503, content={"status": "not ready"})
-        return JSONResponse(status_code=200, content={"status": "ready"})
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"status": "not ready"}
+            )
+        return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "ready"})
 
     Instrumentator().instrument(app).expose(app)
 

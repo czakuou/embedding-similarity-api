@@ -9,8 +9,9 @@ from typing import cast
 from uuid import UUID
 
 import redis.asyncio as redis
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
+from starlette import status
 
 from similarity.analysis import (
     AnalysisRecord,
@@ -20,6 +21,8 @@ from similarity.analysis import (
     missing_record_outcome,
     validate_client_id,
 )
+from similarity.api_paths import SIMILARITY_ANALYSIS_ITEM_ROUTE, analysis_url
+from similarity.dependencies import RedisDep, SettingsDep
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,19 +110,19 @@ async def fetch_record(redis_client: redis.Redis, analysis_id: UUID) -> Analysis
 
 def invalid_client_id_response() -> JSONResponse:
     return JSONResponse(
-        status_code=422,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         media_type="application/problem+json",
         content={
             "type": "about:blank",
             "title": "missing or invalid X-Client-Id",
-            "status": 422,
+            "status": status.HTTP_422_UNPROCESSABLE_CONTENT,
             "code": "VALIDATION_ERROR",
         },
     )
 
 
 def record_to_response_body(record: AnalysisRecord) -> dict[str, object]:
-    location = f"/v1/similarity-analyses/{record.id}"
+    location = analysis_url(record.id)
     body: dict[str, object] = {
         "id": record.id,
         "status": record.status.value,
@@ -145,15 +148,13 @@ def record_to_response_body(record: AnalysisRecord) -> dict[str, object]:
 router = APIRouter()
 
 
-@router.get("/v1/similarity-analyses/{analysis_id}")
+@router.get(SIMILARITY_ANALYSIS_ITEM_ROUTE)
 async def get_analysis(
-    request: Request,
     analysis_id: UUID,
+    settings: SettingsDep,
+    redis_client: RedisDep,
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> JSONResponse:
-    settings = request.app.state.settings
-    redis_client: redis.Redis = request.app.state.redis
-
     validated_client_id = validate_client_id(x_client_id)
     if validated_client_id is None:
         return invalid_client_id_response()
@@ -173,23 +174,23 @@ async def get_analysis(
             if found_record.status in (Status.QUEUED, Status.PROCESSING):
                 headers["Retry-After"] = str(settings.poll_interval_hint_s)
             return JSONResponse(
-                status_code=200, headers=headers, content=record_to_response_body(found_record)
+                status_code=status.HTTP_200_OK,
+                headers=headers,
+                content=record_to_response_body(found_record),
             )
         case Gone():
-            return JSONResponse(status_code=410, content=None)
+            return JSONResponse(status_code=status.HTTP_410_GONE, content=None)
         case NotFound():
-            return JSONResponse(status_code=404, content=None)
+            return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=None)
 
 
-@router.delete("/v1/similarity-analyses/{analysis_id}")
+@router.delete(SIMILARITY_ANALYSIS_ITEM_ROUTE)
 async def delete_analysis(
-    request: Request,
     analysis_id: UUID,
+    settings: SettingsDep,
+    redis_client: RedisDep,
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> JSONResponse:
-    settings = request.app.state.settings
-    redis_client: redis.Redis = request.app.state.redis
-
     validated_client_id = validate_client_id(x_client_id)
     if validated_client_id is None:
         return invalid_client_id_response()
@@ -206,17 +207,17 @@ async def delete_analysis(
     match outcome:
         case DeletableNow():
             await redis_client.delete(analysis_key(str(analysis_id)))
-            return JSONResponse(status_code=204, content=None)
+            return JSONResponse(status_code=status.HTTP_204_NO_CONTENT, content=None)
         case StillInProgress():
             return JSONResponse(
-                status_code=409,
+                status_code=status.HTTP_409_CONFLICT,
                 media_type="application/problem+json",
                 content={
                     "type": "about:blank",
                     "title": "analysis is still queued or processing",
-                    "status": 409,
+                    "status": status.HTTP_409_CONFLICT,
                     "code": "CONFLICT",
                 },
             )
         case Gone() | NotFound():
-            return JSONResponse(status_code=404, content=None)
+            return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=None)

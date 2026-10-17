@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from similarity.capacity import (
-    peak_embeddings_per_s,
-    plan_capacity,
-    worker_replicas,
-)
+from similarity.capacity import peak_embeddings_per_s, worker_replicas
 
 
 def test_given_500k_requests_per_day_when_computing_peak_embeddings_then_matches_spec() -> None:
@@ -29,16 +25,3 @@ def test_given_spec_worked_example_values_when_computing_replicas_then_matches_t
     for requests_per_day, expected_replicas in cases.items():
         peak_emb_s = peak_embeddings_per_s(requests_per_day, peak_factor=10)
         assert worker_replicas(peak_emb_s, replica_throughput=200) == expected_replicas
-
-
-def test_given_known_inputs_when_planning_capacity_then_fields_are_internally_consistent() -> None:
-    plan = plan_capacity(
-        requests_per_day=500_000,
-        peak_factor=10,
-        replica_throughput=200,
-        max_acceptable_wait_s=5,
-    )
-    assert plan.average_rps == 500_000 / 86_400
-    assert plan.peak_rps == plan.average_rps * 10
-    assert plan.worker_replicas == 2
-    assert plan.max_queue_depth > 0

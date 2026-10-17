@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import random
 
-import redis.asyncio as redis
 import structlog
-from fastapi import APIRouter, Form, Header, Request, UploadFile
+from fastapi import APIRouter, Form, Header, UploadFile
 from fastapi.responses import JSONResponse
-from limits import RateLimitItem
-from limits.aio.strategies import FixedWindowRateLimiter
 
-from similarity.config import ApiSettings
+from similarity.api_paths import SIMILARITY_ANALYSES_PATH
+from similarity.dependencies import RateLimiterDep, RateLimitItemDep, RedisDep, SettingsDep
 from similarity.submit.enqueue import decide_and_enqueue
 from similarity.submit.outcomes import (
     Accepted,
@@ -26,18 +24,16 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 
-@router.post("/v1/similarity-analyses")
+@router.post(SIMILARITY_ANALYSES_PATH)
 async def submit_analysis(
-    request: Request,
     file: UploadFile,
+    settings: SettingsDep,
+    redis_client: RedisDep,
+    limiter: RateLimiterDep,
+    rate_limit: RateLimitItemDep,
     query: str = Form(default=""),
     x_client_id: str | None = Header(default=None, alias="X-Client-Id"),
 ) -> JSONResponse:
-    settings: ApiSettings = request.app.state.settings
-    redis_client: redis.Redis = request.app.state.redis
-    limiter: FixedWindowRateLimiter = request.app.state.rate_limiter
-    rate_limit: RateLimitItem = request.app.state.rate_limit_item
-
     raw_content = await file.read(settings.max_file_size_bytes + 1)
     content_too_large = len(raw_content) > settings.max_file_size_bytes
 
