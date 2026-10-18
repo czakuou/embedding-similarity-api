@@ -1,8 +1,8 @@
 """FastAPI Depends() getters for objects stored on app.state at startup.
 
 This is the one place that reads request.app.state; slice handlers declare
-these as Annotated parameters instead (SPEC §3.5: dependencies are passed
-as function arguments -- this just lets FastAPI supply them).
+these as Annotated parameters instead, so dependencies are passed as
+function arguments -- this just lets FastAPI supply them.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ def get_settings(request: Request) -> ApiSettings:
 
 
 def get_clock() -> Clock:
-    """Default clock: real wall-clock time. SPEC §3.5: clock is injected so
+    """Default clock: real wall-clock time. The clock is injected so
     404/410 logic is deterministic in tests, which override this dependency
     (app.dependency_overrides) instead of sleeping for real TTLs.
     """

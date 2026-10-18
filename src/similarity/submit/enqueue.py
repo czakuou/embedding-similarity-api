@@ -31,7 +31,7 @@ from similarity.submit.validation import (
 
 
 def jittered_retry_after(base_s: int, rng: random.Random) -> int:
-    """`base + uniform(0, base)` (SPEC §6.1): avoids a thundering herd of retries."""
+    """`base + uniform(0, base)`: avoids a thundering herd of retries."""
     return base_s + rng.randint(0, base_s)
 
 
@@ -40,9 +40,9 @@ def rate_limit_item(rate_limit: str) -> RateLimitItem:
 
 
 def make_redis_storage(redis_url: str) -> RedisStorage:
-    """Backed by redis.asyncio (implementation='redispy'), not coredis: SPEC's allowed
-    dependency list already includes redis-py for the rest of the app, so this avoids
-    adding a second Redis client library just for rate limiting.
+    """Backed by redis.asyncio (implementation='redispy'), not coredis: redis-py is
+    already a dependency for the rest of the app, so this avoids adding a second
+    Redis client library just for rate limiting.
     """
     result = storage_from_string(f"async+{redis_url}", implementation="redispy")
     if not isinstance(result, RedisStorage):
@@ -75,8 +75,8 @@ async def enqueue(
     document_truncated: bool,
     result_ttl_s: int,
 ) -> Accepted:
-    """Writes the analysis record and the stream message in one MULTI transaction
-    (SPEC §3.4 step 4): there is never a status without a message or vice versa.
+    """Writes the analysis record and the stream message in one MULTI transaction:
+    there is never a status without a message or vice versa.
     """
     analysis_id = uuid7()
     created_at = datetime.now(UTC)
@@ -121,7 +121,7 @@ async def decide_and_enqueue(
     query: str,
     rng: random.Random,
 ) -> Outcome:
-    """Orchestration of the checks in SPEC §6.1, cheapest first.
+    """Orchestration of the request checks, cheapest first.
 
     Order: client id -> rate limit -> file/query validation -> queue depth -> enqueue.
     Rate limiting runs before any body validation, so a 429 costs no upload I/O

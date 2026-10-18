@@ -25,9 +25,9 @@ MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
 @pytest.fixture(scope="session")
 def real_encoder() -> SentenceTransformerEncoder:
-    """The actual model, loaded once for the whole test session (BEHAVIOR.md
-    scenarios run against the real model now, not a fake -- loading it per
-    test would cost several seconds each).
+    """The actual model, loaded once for the whole test session: these
+    scenarios run against the real model, not a fake, and loading it per
+    test would cost several seconds each.
     """
     encoder = SentenceTransformerEncoder(MODEL_NAME, MODEL_REVISION)
     encoder.warm_up()
@@ -41,8 +41,8 @@ class FailingEncoderWrapper:
     the test identifies "the analysis that will fail" by giving it a unique
     document text known only to the test -- not because that text is
     special to the model (it isn't: the real model has no notion of a
-    "poisoned" input). BEHAVIOR.md scenario 5 is a business scenario about
-    failure handling, not about any particular document content.
+    "poisoned" input). This is a business scenario about failure handling,
+    not about any particular document content.
     """
 
     def __init__(self, inner: Encoder, failing_document_text: str) -> None:
@@ -82,9 +82,9 @@ async def get_record(redis_client: redis.Redis, analysis_id: str) -> AnalysisRec
 @pytest.fixture(autouse=True)
 async def _flush_redis_between_tests(redis_container: RedisContainer) -> None:
     """redis_container is session-scoped (one container for the whole run), so
-    every scenario must start from a clean slate (BEHAVIOR.md "FLUSHDB between
-    tests") -- otherwise a previous scenario's queue depth or rate-limit
-    counters leak into the next one.
+    every scenario must start from a clean slate via FLUSHDB -- otherwise a
+    previous scenario's queue depth or rate-limit counters leak into the
+    next one.
     """
     host = redis_container.get_container_host_ip()
     port = redis_container.get_exposed_port(redis_container.port)
@@ -98,9 +98,9 @@ async def _flush_redis_between_tests(redis_container: RedisContainer) -> None:
 @pytest.fixture
 def api_settings_factory(redis_container: RedisContainer) -> ApiSettingsFactory:
     """Builds ApiSettings pointed at the shared test Redis, with small overrides
-    so rate-limit/queue-depth scenarios run in milliseconds (BEHAVIOR.md "How
-    these scenarios run"), not by racing real time windows. Any kwarg can be
-    overridden per-test (e.g. max_queue_depth, max_file_size_bytes).
+    so rate-limit/queue-depth scenarios run in milliseconds instead of by
+    racing real time windows. Any kwarg can be overridden per-test (e.g.
+    max_queue_depth, max_file_size_bytes).
     """
     host = redis_container.get_container_host_ip()
     port = redis_container.get_exposed_port(redis_container.port)
@@ -163,8 +163,8 @@ async def process_one_batch(
     consumer_name: str = "worker-test",
     force_reclaim: bool = False,
 ) -> list[QueueItem]:
-    """Drives the worker exactly one iteration (BEHAVIOR.md: no background
-    threads or sleeps) using the real consumer-group mechanics (XREADGROUP /
+    """Drives the worker exactly one iteration (no background threads or
+    sleeps) using the real consumer-group mechanics (XREADGROUP /
     XAUTOCLAIM) against the same Redis the API wrote to.
     """
     await ensure_consumer_group(

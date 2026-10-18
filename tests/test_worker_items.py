@@ -89,6 +89,6 @@ def test_given_attempts_below_max_when_checking_last_attempt_failure_then_false(
 
 
 def test_given_attempts_at_max_when_checking_last_attempt_failure_then_true() -> None:
-    # BEHAVIOR.md scenario 5: the 3rd failed attempt (not a 4th) is the one that
-    # gives up, so a failed analysis ends with attempts == MAX_ATTEMPTS.
+    # The 3rd failed attempt (not a 4th) is the one that gives up, so a failed
+    # analysis ends with attempts == MAX_ATTEMPTS.
     assert is_last_attempt_failure(attempts=3, max_attempts=3) is True

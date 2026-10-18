@@ -37,7 +37,7 @@ class NotFound:
 
 @dataclass(frozen=True, slots=True)
 class Gone:
-    """Existed but its TTL has elapsed (SPEC §4.2); no tombstone is kept."""
+    """Existed but its TTL has elapsed; no tombstone is kept."""
 
 
 GetOutcome = Found | NotFound | Gone
@@ -51,9 +51,10 @@ def decide_get_outcome(
     result_ttl_s: int,
     now: datetime,
 ) -> GetOutcome:
-    """Pure decision: ownership mismatch is indistinguishable from not-found (SPEC §4.2:
-    existence is not leaked). A missing record falls back to the UUIDv7 timestamp to
-    decide 404 vs 410, since no tombstone is stored.
+    """Pure decision: ownership mismatch is indistinguishable from not-found, so
+    existence is never leaked to a client that doesn't own the record. A missing
+    record falls back to the UUIDv7 timestamp to decide 404 vs 410, since no
+    tombstone is stored.
     """
     if record is None:
         outcome = missing_record_outcome(analysis_id, result_ttl_s, now)
@@ -65,7 +66,7 @@ def decide_get_outcome(
 
 @dataclass(frozen=True, slots=True)
 class DeletableNow:
-    """Owned by this client and in a terminal state (SPEC §4.3): safe to delete."""
+    """Owned by this client and in a terminal state: safe to delete."""
 
     record: AnalysisRecord
 
@@ -86,7 +87,7 @@ def decide_delete_outcome(
     result_ttl_s: int,
     now: datetime,
 ) -> DeleteOutcome:
-    """Pure decision for DELETE (SPEC §4.3)."""
+    """Pure decision for DELETE."""
     if record is None:
         outcome = missing_record_outcome(analysis_id, result_ttl_s, now)
         return Gone() if outcome == "gone" else NotFound()

@@ -1,8 +1,7 @@
 """Fake Encoder for tests: deterministic vectors from a text hash, no torch.
 
 Implements the similarity.encoder.Encoder Protocol. A text containing
-__POISON__ raises, to simulate a document that crashes the real model
-(BEHAVIOR.md scenario 5).
+__POISON__ raises, to simulate a document that crashes the real model.
 """
 
 from __future__ import annotations

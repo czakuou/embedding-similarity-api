@@ -1,7 +1,7 @@
 """Structured logging and worker metrics registry.
 
-client_id is never a metric label (SPEC §8.1): unbounded cardinality would
-bloat Prometheus RAM. It goes to logs instead.
+client_id is never a metric label: unbounded cardinality would bloat
+Prometheus RAM. It goes to logs instead.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from prometheus_client import Counter, Gauge, Histogram
 
 
 def configure_logging(log_level: str) -> None:
-    """JSON logs on stdout (SPEC §8.2): one line per event, no document text or query."""
+    """JSON logs on stdout: one line per event, no document text or query."""
     logging.basicConfig(level=log_level, format="%(message)s", stream=sys.stdout)
     structlog.configure(
         wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelName(log_level)),

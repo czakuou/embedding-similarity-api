@@ -1,4 +1,4 @@
-"""Pure capacity formula from SPEC §7.1. Used by benchmark.py and its tests."""
+"""Pure capacity-planning formula. Used by benchmark.py and its tests."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def peak_embeddings_per_s(
     peak_factor: float,
     query_cache_hit_rate: float = 0.0,
 ) -> float:
-    """SPEC §7.1: average -> peak req/s -> embeddings/s (query + doc, minus cache hits)."""
+    """average -> peak req/s -> embeddings/s (query + doc, minus cache hits)."""
     average_rps = requests_per_day / SECONDS_PER_DAY
     peak_rps = average_rps * peak_factor
     return peak_rps * 2 * (1 - query_cache_hit_rate / 2)

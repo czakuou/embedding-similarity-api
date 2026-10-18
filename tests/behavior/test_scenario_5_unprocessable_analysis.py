@@ -32,7 +32,7 @@ async def test_given_unprocessable_analysis_in_batch_when_processed_then_only_it
 ) -> None:
     # worker_settings fixture sets visibility_timeout_s=1 and max_attempts=3.
     # The real model processes any text successfully; the one analysis that
-    # can never complete is simulated as an infrastructure failure (SPEC §5's
+    # can never complete is simulated as an infrastructure failure (the
     # poison circuit breaker is about *any* repeatedly-failing item, not
     # specifically about text content the model chokes on).
     failing_encoder = FailingEncoderWrapper(real_encoder, UNPROCESSABLE_DOCUMENT_TEXT)

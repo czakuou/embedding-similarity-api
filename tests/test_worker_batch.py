@@ -96,7 +96,7 @@ async def test_given_healthy_item_when_batch_processed_then_record_is_done(
     assert record.result is not None
     assert len(record.result) == 1
     assert -1.0 <= record.result[0] <= 1.0
-    assert await redis_client.xlen(STREAM_KEY) == 0  # acked and deleted (SPEC §6.3)
+    assert await redis_client.xlen(STREAM_KEY) == 0  # acked and deleted
 
 
 async def test_given_poisoned_item_among_healthy_when_processed_then_only_poison_unacked(
@@ -211,7 +211,7 @@ async def test_given_attempts_exhausted_on_reclaim_when_batch_processed_then_fai
     assert failed.attempts == 3  # the circuit breaker itself: MAX_ATTEMPTS=2 -> gave up on the 3rd
     assert failed.error is not None
     assert failed.error.code == "PROCESSING_FAILED"
-    assert await redis_client.xlen(STREAM_KEY) == 0  # acked and deleted (SPEC §6.3)
+    assert await redis_client.xlen(STREAM_KEY) == 0  # acked and deleted
 
 
 async def test_given_missing_record_when_batch_processed_then_message_is_skipped_and_acked(

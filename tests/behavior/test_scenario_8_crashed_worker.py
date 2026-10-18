@@ -23,13 +23,13 @@ async def test_given_crashed_worker_when_message_idle_then_reclaimed_and_complet
     worker_settings: WorkerSettings,
     real_encoder: SentenceTransformerEncoder,
 ) -> None:
-    # worker_settings fixture sets visibility_timeout_s=1 (BEHAVIOR.md).
+    # worker_settings fixture sets visibility_timeout_s=1.
     response = submit_valid_document(app_client, "client-a")
     assert response.status_code == status.HTTP_202_ACCEPTED, response.text
     analysis_id = response.json()["id"]
 
     # w1 reads the message (creating a pending-entry in the consumer group)
-    # and increments attempts (SPEC §5: HINCRBY before computing) but crashes
+    # and increments attempts (HINCRBY happens before computing) but crashes
     # before ever acking it -- simulated by stopping right there.
     await ensure_consumer_group(
         worker_redis, worker_settings.stream_key, worker_settings.consumer_group

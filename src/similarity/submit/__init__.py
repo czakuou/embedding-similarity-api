@@ -1,7 +1,7 @@
 """POST slice: validation, pre-cut, rate limiting, backpressure, MULTI enqueue.
 
-Split into a package because the slice outgrew ~300 lines (SPEC §3.5), not
-because of a layering concern: validation.py (pure), outcomes.py (pure sum
+Split into a package because the slice outgrew a reasonable single-file size,
+not because of a layering concern: validation.py (pure), outcomes.py (pure sum
 type + response mapping), enqueue.py (Redis I/O), router.py (HTTP handler).
 Other slices still only reach into this package's public API below.
 """

@@ -5,7 +5,7 @@ import sys
 
 
 def test_given_api_module_when_imported_then_torch_is_not_loaded() -> None:
-    """The lightweight API image must never pull in torch (SPEC §3.5)."""
+    """The lightweight API image must never pull in torch."""
     result = subprocess.run(
         [sys.executable, "-c", "import similarity.api; import sys; print('torch' in sys.modules)"],
         capture_output=True,

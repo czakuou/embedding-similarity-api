@@ -20,7 +20,7 @@ CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 def validate_client_id(client_id: str | None) -> str | None:
     """Returns the client id if valid, None otherwise. Shared by submit.py and
-    results.py: both need the same `X-Client-Id` format contract (SPEC §4.1).
+    results.py: both need the same `X-Client-Id` format contract.
     """
     if client_id is None:
         return None
@@ -67,7 +67,7 @@ class IllegalTransition:
 
 
 def transition(status: Status, event: Event) -> Status | IllegalTransition:
-    """Pure state machine from SPEC §5. `failed` and `done` are terminal."""
+    """Pure state machine. `failed` and `done` are terminal."""
     match (status, event):
         case (Status.QUEUED, WorkerPicked()):
             return Status.PROCESSING
@@ -189,7 +189,7 @@ GoneOrNotFound = Literal["gone", "not_found"]
 
 
 def missing_record_outcome(analysis_id: UUID, result_ttl_s: int, now: datetime) -> GoneOrNotFound:
-    """Decide 410 vs 404 for a record that no longer exists in Redis (SPEC §4.2).
+    """Decide 410 vs 404 for a record that no longer exists in Redis.
 
     No tombstones are stored, so the only evidence left is the UUIDv7 timestamp
     embedded in the id itself.

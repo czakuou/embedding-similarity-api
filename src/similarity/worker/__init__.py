@@ -2,8 +2,8 @@
 reclaim, heartbeat, warm-up, SIGTERM.
 
 A package from the start (not split later): the loop, batch processing, and
-item parsing are naturally separate concerns and together would exceed the
-SPEC §3.5 ~300-line-per-file guideline.
+item parsing are naturally separate concerns and together would exceed a
+reasonable single-file size.
 """
 
 from __future__ import annotations

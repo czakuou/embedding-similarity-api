@@ -58,7 +58,7 @@ def test_given_record_missing_and_ttl_not_elapsed_when_checking_outcome_then_not
 
 
 def test_given_record_missing_at_exact_ttl_boundary_when_checking_outcome_then_not_found() -> None:
-    # SPEC: "id_time + RESULT_TTL_S < now" -> strictly less than, so equality is still "not_found".
+    # "id_time + RESULT_TTL_S < now" -> strictly less than, so equality is still "not_found".
     now = FIXED_UUID7_CREATED_AT + timedelta(hours=24)
     assert missing_record_outcome(FIXED_UUID7, result_ttl_s=86_400, now=now) == "not_found"
 

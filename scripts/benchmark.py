@@ -2,8 +2,8 @@
 
 Run inside the worker container/environment (needs the `worker` dependency
 group: torch + sentence-transformers). Prints p50/p95 batch latency per
-batch size, T (embeddings/s), and the SPEC §7 replica table computed from
-the measured T -- see SPEC §7.3: results are local, re-run on the target SKU.
+batch size, T (embeddings/s), and a replica table computed from the measured
+T -- results are local to this machine, re-run on the target SKU.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from similarity.encoder import SentenceTransformerEncoder
 
 QUERY_TEXT = "fox over dog"  # ~5 tokens, representative of a short query
 DOC_TEXT = ("The quick brown fox jumps over the lazy dog. " * 100)[:4096]  # pre-cut length; the
-# model truncates internally at 256 tokens regardless of how much of this is fed in (SPEC A3).
+# model truncates internally at 256 tokens regardless of how much of this is fed in.
 
 BATCH_SIZES = (1, 8, 16, 32, 64)
 WARMUP_ITERATIONS = 3
@@ -74,9 +74,9 @@ def benchmark_batch_sizes(
         durations = measure_batch(encoder, batch_size, iterations)
         p50 = percentile(durations, 50)
         p95 = percentile(durations, 95)
-        # T is embeddings/s counting both halves of the pair (SPEC §7.1's peak_emb_s
-        # already multiplies peak_rps by 2 for exactly this reason: one analysis
-        # costs one query embedding plus one document embedding).
+        # T is embeddings/s counting both halves of the pair: peak_embeddings_per_s
+        # multiplies peak_rps by 2 for exactly this reason -- one analysis costs one
+        # query embedding plus one document embedding.
         throughput = (batch_size * 2) / p50
         results.append(
             BatchMeasurement(
@@ -108,7 +108,7 @@ def measure_query_vs_document_cost(
 def print_replica_table(best_measurement: BatchMeasurement, max_acceptable_wait_s: float) -> None:
     print()
     print(f"Replica table (T = {best_measurement.throughput_emb_s:.1f} emb/s, measured locally,")
-    print("peak factor = 10x, cache hit rate H = 0 -- SPEC §7.1/§7.2):")
+    print("peak factor = 10x, cache hit rate H = 0):")
     print(f"{'Requests/day':>15} | {'Peak emb/s':>12} | {'Replicas':>8} | {'Queue depth':>11}")
     for requests_per_day in (100_000, 500_000, 1_000_000, 5_000_000):
         peak_emb_s = peak_embeddings_per_s(requests_per_day, peak_factor=10)
@@ -131,7 +131,7 @@ def main() -> None:
         "--max-acceptable-wait-s",
         type=float,
         default=5.0,
-        help="MAX_ACCEPTABLE_WAIT_S for the queue-depth formula (SPEC A10 SLA default: 5s)",
+        help="MAX_ACCEPTABLE_WAIT_S for the queue-depth formula (SLA default: 5s)",
     )
     args = parser.parse_args()
 
@@ -165,8 +165,8 @@ def main() -> None:
     worst_p95_s = max(m.p95_s for m in measurements)
     print(
         f"\nWorst observed p95 batch time (across all batch sizes): {worst_p95_s * 1000:.1f} ms"
-        f"\nVISIBILITY_TIMEOUT_S must exceed this (SPEC: 'set from the measured p95 batch "
-        f"time'); round up generously for headroom under real load."
+        f"\nVISIBILITY_TIMEOUT_S must exceed this -- set from the measured p95 batch time; "
+        f"round up generously for headroom under real load."
     )
     print_replica_table(best, args.max_acceptable_wait_s)
 

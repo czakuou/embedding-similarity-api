@@ -1,7 +1,8 @@
 """Encoder Protocol + sentence-transformers implementation.
 
-The only module that imports torch / sentence-transformers (SPEC §3.5): a
-unit test asserts that importing similarity.api never pulls this module in.
+The only module that imports torch / sentence-transformers, so the API
+image can stay lightweight: a unit test asserts that importing similarity.api
+never pulls this module in.
 """
 
 from __future__ import annotations

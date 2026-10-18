@@ -1,6 +1,6 @@
 """One batch: increment attempts, encode + pairwise similarity, write results.
 
-process_batch is the single entry point driven directly by BEHAVIOR.md tests
+process_batch is the single entry point driven directly by the behavior tests
 (one loop iteration, no background threads) and by the real consumer loop.
 """
 
@@ -48,7 +48,7 @@ async def fetch_record_or_none(
 
 
 async def increment_attempts(redis_client: redis.Redis, analysis_id: str) -> int:
-    """HINCRBY before computing (SPEC §5): a worker killed mid-batch never reaches an
+    """HINCRBY before computing: a worker killed mid-batch never reaches an
     except block, so counting at the start guarantees MAX_ATTEMPTS is eventually hit.
 
     Only called once fetch_record_or_none has confirmed the record exists: HINCRBY on
@@ -97,7 +97,7 @@ def failed_record(
 
 
 def observe_terminal(record: AnalysisRecord, *, now: datetime) -> None:
-    """SPEC §8.1 metrics for a record reaching a terminal state (done or failed)."""
+    """Metrics for a record reaching a terminal state (done or failed)."""
     analyses_completed_total.labels(status=record.status.value).inc()
     analysis_end_to_end_seconds.observe((now - record.created_at).total_seconds())
     if record.attempts > 1:
@@ -115,8 +115,9 @@ async def write_and_ack(
     msg_id: str,
     now: datetime,
 ) -> None:
-    """Writes the updated record (re-applying its TTL, SPEC §5 expiry invariant) and
-    acks + deletes the stream message in one pipeline.
+    """Writes the updated record (re-applying its TTL, since every write to a
+    record must preserve its expiry invariant) and acks + deletes the stream
+    message in one pipeline.
     """
     async with redis_client.pipeline(transaction=True) as pipe:
         pipe.hset(analysis_key(record.id), mapping=record_to_hash(record))
@@ -137,7 +138,7 @@ async def give_up_on_item(
     consumer_group: str,
     now: datetime,
 ) -> None:
-    """SPEC §5 poison circuit breaker: attempts exhausted, fail without computing."""
+    """Poison circuit breaker: attempts exhausted, fail without computing."""
     updated = failed_record(record, attempts=attempts, now=now, message="maximum attempts exceeded")
     await write_and_ack(
         redis_client,
@@ -153,7 +154,7 @@ async def give_up_on_item(
 async def skip_missing_item(
     redis_client: redis.Redis, item: QueueItem, *, stream_key: str, consumer_group: str
 ) -> None:
-    """SPEC §5: a record that no longer exists (expired or deleted) is skipped and
+    """A record that no longer exists (expired or deleted) is skipped and
     acked -- no resurrection.
     """
     await redis_client.xack(stream_key, consumer_group, item.msg_id)
@@ -178,7 +179,7 @@ async def process_item_alone(
     now: datetime,
 ) -> None:
     """Used both for a one-item batch and to retry an item after a whole-batch
-    encode failure (SPEC §5: one bad document must not fail the other 31).
+    encode failure: one bad document must not fail the rest of the batch.
     """
     try:
         result = await compute_one(encoder, item)
@@ -219,10 +220,10 @@ async def process_batch(
     now: datetime,
 ) -> None:
     """Processes a whole batch: items whose record no longer exists are skipped first
-    (SPEC §5: no resurrection), then attempts are incremented for the rest before any
+    (no resurrection), then attempts are incremented for the rest before any
     computation. Items with attempts exhausted are resolved immediately, and the rest
-    are encoded together in one call (SPEC §6.2). If that call raises, items are
-    retried one by one so one poisoned document can't fail the others.
+    are encoded together in one call. If that call raises, items are retried one by
+    one so one poisoned document can't fail the others.
     """
     live_items: list[tuple[QueueItem, AnalysisRecord, int]] = []
     for item in items:

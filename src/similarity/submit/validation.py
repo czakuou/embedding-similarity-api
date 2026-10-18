@@ -14,7 +14,7 @@ def validate_filename(filename: str | None) -> bool:
 
 
 def decode_document(raw: bytes) -> str | None:
-    """Strict UTF-8 decode; SPEC A4: headers can lie, decoding is the real validation."""
+    """Strict UTF-8 decode; headers can lie, decoding is the real validation."""
     try:
         return raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
@@ -22,7 +22,7 @@ def decode_document(raw: bytes) -> str | None:
 
 
 def validate_query(query: str) -> str | None:
-    """SPEC A5: 1-1000 chars after trimming. Returns the trimmed query, or None if invalid."""
+    """1-1000 chars after trimming. Returns the trimmed query, or None if invalid."""
     trimmed = query.strip()
     if not (1 <= len(trimmed) <= 1_000):
         return None
@@ -36,7 +36,7 @@ class PreCutDocument:
 
 
 def pre_cut_document(text: str, max_doc_chars: int) -> PreCutDocument:
-    """SPEC A3: pre-cut to MAX_DOC_CHARS; the model truncates further at 256 tokens."""
+    """Pre-cut to MAX_DOC_CHARS; the model truncates further at 256 tokens."""
     if len(text) <= max_doc_chars:
         return PreCutDocument(text=text, truncated=False)
     return PreCutDocument(text=text[:max_doc_chars], truncated=True)

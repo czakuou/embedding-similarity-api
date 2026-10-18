@@ -37,7 +37,7 @@ async def test_given_expired_analysis_when_polled_then_410(
 
     # The record's own TTL (RESULT_TTL_S) has elapsed in Redis -- the API's
     # 404-vs-410 decision then falls back to the UUIDv7 timestamp embedded in
-    # analysis_id, compared against the injected clock (SPEC §3.5).
+    # analysis_id, compared against the injected clock.
     await worker_redis.delete(f"analysis:{analysis_id}")
     real_now = get_clock()()
 

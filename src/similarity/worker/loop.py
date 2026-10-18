@@ -37,14 +37,14 @@ async def ensure_consumer_group(
 
 
 def write_heartbeat(heartbeat_path: str) -> None:
-    """Updated on every loop iteration, including empty reads (SPEC §8.3), so an idle
+    """Updated on every loop iteration, including empty reads, so an idle
     worker never looks dead.
     """
     Path(heartbeat_path).write_text(str(time.time()))
 
 
 async def observe_queue_metrics(redis_client: redis.Redis, stream_key: str) -> None:
-    """queue_oldest_age_seconds is the primary alert signal (SPEC §8.1): a stream
+    """queue_oldest_age_seconds is the primary alert signal: a stream
     entry ID's leading part is a millisecond timestamp, so age is free to compute.
     """
     depth = await redis_client.xlen(stream_key)
@@ -108,10 +108,10 @@ async def run_one_iteration(
 ) -> list[QueueItem]:
     """One pass of the consumer loop body: read, maybe reclaim, process, observe.
 
-    Pulled out of run() so BEHAVIOR.md scenarios can drive the worker
-    deterministically -- no background threads or sleeps (SPEC §13) -- by
-    calling this once per expected batch instead of running the real loop.
-    Returns the items processed, so a test can assert on batch composition.
+    Pulled out of run() so behavior-test scenarios can drive the worker
+    deterministically -- no background threads or sleeps -- by calling this
+    once per expected batch instead of running the real loop. Returns the
+    items processed, so a test can assert on batch composition.
     """
     items = await read_batch(
         redis_client,
