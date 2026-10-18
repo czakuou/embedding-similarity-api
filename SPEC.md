@@ -1,6 +1,6 @@
 # Document Similarity Service: SPEC
 
-> Status: approved design, ready for implementation.
+> Status: implemented; see §16 for deviations.
 > Companion file: [`BEHAVIOR.md`](BEHAVIOR.md) (business scenarios, mapped 1:1 to tests).
 > Every component below has a one-sentence "why". If it can't be justified, it is not in the build.
 
@@ -60,8 +60,8 @@ C4Container
   title Containers: Document Similarity Service
   Person(client, "API client")
   System_Boundary(dss, "Document Similarity Service") {
-    Container(api, "API", "Python 3.12, FastAPI, uvicorn", "Validation, rate limiting, backpressure, status reads. No torch in the image")
-    Container(worker, "Worker", "Python 3.12, sentence-transformers (CPU torch)", "Greedy micro-batched embeddings + pairwise similarity. N replicas")
+    Container(api, "API", "Python 3.13, FastAPI, uvicorn", "Validation, rate limiting, backpressure, status reads. No torch in the image")
+    Container(worker, "Worker", "Python 3.13, sentence-transformers (CPU torch)", "Greedy micro-batched embeddings + pairwise similarity. N replicas")
     ContainerDb(redis, "Redis", "Redis 7.4, AOF everysec, noeviction", "Stream = queue, hashes = analysis state with TTL, rate-limit counters")
   }
   System_Ext(prom, "Prometheus", "Metrics scraping")
@@ -134,14 +134,24 @@ sequenceDiagram
 
 ```
 src/similarity/
-├── submit.py         # POST slice: route, validation + pre-cut, rate limit, backpressure, MULTI enqueue
+├── submit/           # POST slice, split into a package once submit.py passed ~300 lines:
+│   ├── validation.py #   pure: filename/UTF-8/query checks, pre-cut
+│   ├── outcomes.py    #   sum type Accepted|RateLimited|QueueFull|Invalid -> HTTP response
+│   ├── enqueue.py      #   I/O: rate limit, queue depth, MULTI enqueue
+│   └── router.py       #   FastAPI route
 ├── results.py        # GET + DELETE slice: route, 404 / 410 / 409 decisions, reads and deletes
-├── worker.py         # worker slice: loop, greedy batching, per-item isolation, attempts,
-│                     # reclaim, heartbeat, warm-up, SIGTERM
+├── worker/            # worker slice, split into a package for the same reason:
+│   ├── items.py        #   pure: parse stream messages, attempt-overflow decisions
+│   ├── batch.py         #   pure decisions + Redis I/O: one batch end to end
+│   ├── loop.py          #   the consumer loop: read, reclaim, heartbeat, SIGTERM
+│   └── main.py          #   entrypoint: load settings, load + warm up the model, run the loop
 ├── encoder.py        # Encoder Protocol + sentence-transformers implementation (the only torch import)
 ├── analysis.py       # shared kernel: record schema, Redis key names, statuses + transition(),
 │                     # UUIDv7 / expiry math
 ├── capacity.py       # pure capacity formula (benchmark + tests)
+├── api_paths.py       # single source of truth for /v1/... path construction
+├── dependencies.py   # FastAPI Depends() getters (Annotated aliases), so slices take
+│                     # dependencies as typed function arguments rather than reading app.state
 ├── observability.py  # metrics registry, structlog setup
 ├── api.py            # FastAPI app factory: slice routers, /health, /ready, /metrics, Problem Details
 └── config.py         # pydantic-settings
@@ -149,16 +159,18 @@ scripts/
 ├── benchmark.py
 └── benchmark.sh
 tests/
-├── test_submit.py  test_results.py  test_worker.py  test_analysis.py  test_capacity.py
-└── behavior/        # scenarios from BEHAVIOR.md
+├── test_submit_validation.py  test_submit_enqueue.py  test_results.py
+├── test_worker_items.py  test_worker_batch.py  test_analysis.py  test_capacity.py
+├── test_config.py  test_api_no_torch.py
+└── behavior/        # scenarios from BEHAVIOR.md, run against the real model (see §16 item 9)
 ```
 
 **Rules:**
-- **One slice = one file** with everything the feature needs: route or loop, pure decision functions, Redis calls. Understanding or changing a feature means opening one file.
+- **One slice = one file** with everything the feature needs: route or loop, pure decision functions, Redis calls. Understanding or changing a feature means opening one file (or, once a slice outgrows ~300 lines, one small package — see below).
 - **Inside a file:** pure functions first (data in, data or sum type out), the I/O handler last. Functional core / imperative shell is applied per file, not as a layer.
-- **Slices never import each other.** Shared code is limited to the cross-process contract (`analysis.py`: key names, record schema, transitions, expiry), `config.py`, `observability.py` and `encoder.py`.
-- **A file becomes a package** (e.g. `submit/`) only when it outgrows ~300 lines, not before.
-- Dependencies are passed as function arguments; clock and RNG are injected, so jitter and `404`/`410` logic are deterministic in tests. No DI container, no service classes.
+- **Slices never import each other.** Shared code is limited to the cross-process contract (`analysis.py`: key names, record schema, transitions, expiry), `config.py`, `api_paths.py`, `dependencies.py`, `observability.py` and `encoder.py`.
+- **A file becomes a package** (e.g. `submit/`, `worker/`) only when it outgrows ~300 lines, not before. Both did during implementation; test files were split the same way so each test module mirrors one source module.
+- Dependencies are passed as function arguments; clock and RNG are injected, so jitter and `404`/`410` logic are deterministic in tests. No DI container, no service classes. In practice the clock is injected via FastAPI's `Depends()` (`ClockDep`, overridden in tests); the jitter RNG is a plain constructor argument threaded through from the route handler, not a `Depends()` — see §16 item 8.
 - Outcomes are sum types matched with `match`, e.g. `Accepted | RateLimited | QueueFull | Invalid`. Business errors are values; exceptions are for infrastructure failures.
 - State transitions are a pure function `transition(status, event) -> Status | IllegalTransition` in `analysis.py`.
 - No monad libraries (e.g. `returns`): plain sum types give the same clarity without the learning curve.
@@ -517,7 +529,7 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 | Layer | What | How | Budget |
 |---|---|---|---|
 | Unit (pure) | Validation; `404` vs `410` from UUIDv7; `Retry-After` bounds; state transitions; attempt overflow → `failed`; pairwise result shape (`list[float]`, not `[[...]]`); capacity formula; config invariants | Plain pytest on the pure functions of each slice and `analysis.py`; injected clock and RNG; "API import does not load torch" check | ~20 min |
-| Behaviour (BDD) | Business scenarios in `BEHAVIOR.md`, mapped 1:1 to `test_given_..._when_..._then_...` | FastAPI `TestClient` + one iteration of the `worker.py` loop (`process_batch`) driven in-process + **real Redis via testcontainers** (session-scoped container, `FLUSHDB` between tests) + **fake encoder** (deterministic vectors; a marker string raises to simulate poison) | ~25 min |
+| Behaviour (BDD) | Business scenarios in `BEHAVIOR.md`, mapped 1:1 to `test_given_..._when_..._then_...` | FastAPI `TestClient` + one iteration of the worker loop (`process_batch`) driven in-process + **real Redis via testcontainers** (session-scoped container, `FLUSHDB` between tests) + **the real pinned model**, loaded once per test session. Changed from a fake encoder during implementation (§16 item 9): these are integration tests meant to prove the service itself works, which a fake model can't do. The one scenario about a failure that "can never succeed" simulates an infrastructure-level failure via a wrapper around the real encoder, not a poisoned input. | ~60 s with the real model |
 | Model | Throughput and latency, not correctness | `benchmark.py` (§7) | — |
 | Smoke | `docker compose up` + `curl` happy path | Manual / README | — |
 
@@ -547,6 +559,8 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 14. **Multi-file submissions** in one request; chunking for documents beyond the model context.
 15. **Per-tier retention**; long-term export (Blob + lifecycle management).
 16. **Model outside the image** (Blob / Azure ML registry) for multiple or large models; image scanning (Trivy / Defender for Containers); coverage threshold; Managed Identity to Redis.
+17. **`batch_id` correlation and cold-start duration in logs** (§8.2 named both as log fields; neither is implemented -- see §16 item 10). A worker currently logs `analysis_id` per item but nothing ties the items of one batch together, and `worker.model_loaded` carries no timing.
+18. **`dev` Docker target with live-reload** for local API development, instead of rebuilding the production-oriented multi-stage image on every change.
 
 ---
 
@@ -572,4 +586,26 @@ Estimates assume implementation with a coding agent **including reading and unde
 ### README must also contain
 
 - **Known limitations:** spoofable `X-Client-Id` (full auth needed); benchmark numbers are local and must be re-measured on the target machine; dev/prod broker parity gap (ADR-001); single-node Redis.
-- **How this was built:** design decisions recorded in this SPEC (with rejected alternatives); implementation done with an AI coding agent against the SPEC and reviewed line by line.
+- **How this was built:** design decisions recorded in this SPEC (with rejected alternatives); implementation done with an AI coding agent against the SPEC.
+
+---
+
+## 16. Implementation notes & deviations
+
+Produced by auditing the finished code against this SPEC. Only real deviations are listed; places
+where the code matches the design are not repeated here.
+
+| # | SPEC said | Implemented | Reason | Impact |
+|---|---|---|---|---|
+| 1 | Python 3.12 | Python 3.13 everywhere (`pyproject.toml`, Dockerfile, CI) | 3.13 was already available; no reason to target an older runtime | None -- a strict improvement |
+| 2 | One file per slice (§3.5) | `submit/` and `worker/` are packages (4-5 files each) | Both slices passed the ~300-line threshold that §3.5 itself sets as the trigger | None -- the rule was followed, not broken |
+| 3 | §3.5 file tree lists `dependencies.py`/`api_paths.py` nowhere | Both exist: `dependencies.py` holds the FastAPI `Depends()` getters so slices take typed `Annotated` parameters instead of reading `request.app.state`; `api_paths.py` centralises `/v1/...` path construction | Removes repeated magic strings and manual `app.state` lookups across slices | None -- both are small, single-purpose, and consistent with "shared code limited to the cross-process contract + config + observability + encoder" |
+| 4 | Test files: `test_submit.py`, `test_worker.py` (§3.5) | Split into `test_submit_validation.py`/`test_submit_enqueue.py` and `test_worker_items.py`/`test_worker_batch.py`, plus new `test_config.py`, `test_api_no_torch.py` | Mirrors the source package split (item 2); each test module maps to one source module | None |
+| 5 | §6.1 layer 0: `uvicorn --limit-concurrency` protects against API flooding | `API_CONCURRENCY_LIMIT` existed in `config.py`/`.env.example` but nothing read it until this audit found the gap; now wired into the API Dockerfile's `CMD` via shell-form env interpolation | Oversight during implementation: the setting was added to the config model but never connected to the one place that can apply it | Fixed; before the fix, layer 0 of the four-layer overload defense was absent despite being documented as present |
+| 6 | §8.2 log fields: `batch_id`, `duration_ms`, `error_type` | None of the three exist in any log call. `analysis_id` is logged per item; no identifier correlates items processed in the same batch | Not implemented; no record of why | **Not fixed** -- tracked as TODO §14 item 17. Reduces the ability to correlate "this batch's 32 items" in log search, and to query by duration or failure type without parsing messages |
+| 7 | §8.2: `worker.model_loaded` log event carries cold-start duration | The event is logged (`worker/loop.py`) but with no timing field; `main.py` never measures how long model load + warm-up took | Not implemented | **Not fixed** -- tracked as TODO §14 item 17. Cold-start time is currently invisible in logs/metrics |
+| 8 | §3.5: "clock and RNG are injected" | The clock is injected via `Depends()` (`ClockDep`, overridden in tests). The jitter RNG is a plain constructor argument (`random.Random()`) created fresh in `submit/router.py`'s handler and threaded through as a function argument to `decide_and_enqueue()`, not supplied via `Depends()` | `decide_and_enqueue()` takes `rng` as a parameter either way, so it is deterministic and testable without DI; the router just doesn't use the same mechanism as the clock | Cosmetic inconsistency only -- both paths are testable, but the two "injected" dependencies the rule names are injected two different ways |
+| 9 | §13: BDD scenarios use a fake encoder; real model is benchmarked separately | All 8 BEHAVIOR.md scenarios load and run the real pinned model (session-scoped fixture); the fake encoder (`tests/fake_encoder.py`) now backs only the pure unit tests of `process_batch` logic (`test_worker_batch.py`) | A fake-model "integration" test proves the plumbing works, not that the service works; decided during implementation that these tests should prove the latter | Full suite runtime grew from ~20s to ~60-70s. Scenario 5 ("poisoned document") was reframed to "an analysis that can never succeed", since a real model has no notion of a poisoned input -- it is now simulated as one analysis's embedding call raising, via a wrapper around the real encoder, not a special input string |
+| 10 | (not in original SPEC) | `Makefile` added for common dev commands (install, test variants split by the `behavior` pytest marker, lint/format/typecheck, audit, local run targets, compose lifecycle) | Convenience wrapper around commands already in use; not a design decision | None |
+
+None of the above change the API contract (§4), the job lifecycle (§5), or the capacity formula (§7).
