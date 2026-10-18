@@ -8,6 +8,16 @@ separate worker pool computes results asynchronously, so a traffic burst degrade
 time instead of the API itself. Full design rationale lives in [`SPEC.md`](SPEC.md); business
 scenarios in [`BEHAVIOR.md`](BEHAVIOR.md).
 
+**The 30-second version:**
+
+| Decision | In one line |
+|---|---|
+| [Overload handling](#how-overload-is-handled) | Four cheapest-first protection layers turn overload into an explicit `429`/`503` + `Retry-After`, never a timeout |
+| [API/worker split](#architecture) | The API never imports `torch`; a stuck or slow worker can't take down health checks or request handling |
+| [Redis as the single backing service](#adr-001-redis-as-the-single-backing-service) | Queue, state, and rate limits on one Redis for a 2-4h prototype, with a documented migration path to Azure Service Bus |
+| [Retention](#key-decisions-and-trade-offs) | TTL from creation, `410` decided from the UUIDv7 timestamp itself, no tombstone storage needed |
+| [Capacity model](#capacity-model) | One measured number (`T`, embeddings/s per replica) drives replica count and queue-depth sizing for any traffic level |
+
 **Start here:** [Run it](#run-it) · [Architecture](#architecture) · [Key decisions](#key-decisions-and-trade-offs)
 · [Known limitations](#known-limitations) · [TODO](#todo)
 
@@ -124,12 +134,15 @@ the model's context window (chunking).
 | Hardware | CPU only, no GPU | assumed |
 | Worker throughput `T` | varies by machine | **measured** (see [Capacity model](#capacity-model)) |
 | SLA | p95 accept < 100ms; p95 time-to-result < 5s at nominal load | assumed |
-| Result format | `list[float]` of length 1 | known (task's `[[0.87]]` flattened deliberately) |
+| Result format | `list[float]` of length 1, computed pairwise (query *i* vs document *i*), never as an N x N similarity matrix | known (task's `[[0.87]]` flattened deliberately) |
 | Client identity | `X-Client-Id` header, no real auth | assumed; **spoofable**, see [Known limitations](#known-limitations) |
-| Retention | 24h from creation, then `410 Gone` | assumed |
+| Retention | 24h from creation, then `410 Gone`; document/query text itself lives only in the stream message until the worker acks it, not in the retained record | assumed |
 | Delivery semantics | at-least-once | known (embedding is deterministic, so a duplicate computation is harmless) |
 
 ## Architecture
+
+This is where the I/O-bound/CPU-bound separation lives: the API container never imports `torch`,
+and the worker container is the only place that does.
 
 ```mermaid
 C4Container
@@ -221,8 +234,9 @@ A unit test (`test_api_no_torch.py`) asserts that importing `similarity.api` nev
 
 ## API at a glance
 
-Base path `/v1/similarity-analyses`. Errors use RFC 9457 Problem Details
-(`application/problem+json`) with an extra `code` field.
+The client-facing contract: what a client sees at every stage of an analysis's lifecycle. Base
+path `/v1/similarity-analyses`. Errors use RFC 9457 Problem Details (`application/problem+json`)
+with an extra `code` field.
 
 | Method | Status | When | Notes |
 |---|---|---|---|
@@ -277,6 +291,16 @@ naturally (throughput like full batching). No timer waits for a batch to fill.
 that call raises, every item in the batch is retried **individually** instead of the whole batch
 failing, so one bad document can't fail the rest (`worker/batch.py`'s `process_batch` ->
 `process_item_alone` fallback).
+
+**Attempts and retry:** `attempts` is incremented **before** computing, not after a failure --
+a worker killed mid-batch (e.g. the OOM killer) never reaches an `except` block, so counting at
+the start guarantees a message that kills workers eventually stops being retried, at
+`MAX_ATTEMPTS`. A message whose attempts are exhausted when reclaimed is failed without even
+attempting computation (the "poison circuit breaker"). `VISIBILITY_TIMEOUT_S` -- how long before
+an unacked message is reclaimed from a possibly-crashed worker -- should be set from the measured
+worst p95 batch time (`scripts/benchmark.py` prints this), with headroom: too short reclaims
+healthy in-flight work and double-processes it (harmless but wasteful, since embedding is
+deterministic); too long delays recovery from a real crash.
 
 **Redis Streams pitfalls handled:**
 
@@ -354,6 +378,9 @@ artifact of this local setup, not a capacity number. Always re-run on hardware m
 deployment target before sizing replicas or `MAX_QUEUE_DEPTH` from it.
 
 ## Observability
+
+What an operator can actually see once this is running, mapped to the operational question each
+signal answers:
 
 | Question | Metric | Type | Where |
 |---|---|---|---|
@@ -440,7 +467,8 @@ config fails the container at boot rather than misbehaving at runtime. Full list
 | Rate limiting | `limits` library, fixed window, Redis storage | hand-written; token bucket (Lua) | Ready tool; up to 2x burst at window edges is acceptable for a prototype |
 | Queue limit | Soft (`XLEN` then `XADD`) | atomic Lua check-and-add | Overshoot is bounded by concurrent in-flight POSTs; acceptable, not atomic -- see [How overload is handled](#how-overload-is-handled) |
 | Retention | TTL from creation; `410` from the UUIDv7 timestamp, no tombstones | tombstones; TTL from completion | Zero extra storage; `expires_at` is knowable at creation time, so it can be returned in the `202` body |
-| Model delivery | Baked into the image at a pinned revision, `HF_HUB_OFFLINE=1` | download at container start; mount from storage | No runtime dependency on Hugging Face during scale-out; reproducible builds |
+| Model delivery | Baked into the worker image at a pinned revision at build time, `HF_HUB_OFFLINE=1` at runtime, warmed up with one throwaway encode call before serving traffic | download at container start; mount from storage | No runtime dependency on Hugging Face during scale-out; reproducible builds; warm-up avoids paying lazy-init cost on the first real request |
+| Base image split | Multi-stage `Dockerfile` (`api` target: no torch; `worker` target: CPU-only torch from a dedicated PyTorch CPU wheel index, not the default PyPI GPU build) | one image with everything | Smaller API image, no CUDA weight downloaded for a CPU-only deployment |
 | Observability | Prometheus + JSON logs + `analysis_id` correlation | OpenTelemetry + collector | Same diagnostic value at a fraction of the setup cost; OTel is TODO |
 | Tests | Real pinned model + real Redis (testcontainers) for BDD; fake encoder only for `process_batch` unit tests | mocked Redis (fakeredis) anywhere; fake model in the integration layer | A fake-model "integration" test proves the plumbing works, not that the service works -- see [deviations](#deviations-from-the-original-design) item 9 |
 | Code organisation | Flat vertical slices + small shared kernel | layered `domain/`/`application/`/`adapters/` | A feature lives in (mostly) one file; the only cross-cutting module is the API<->worker contract |
