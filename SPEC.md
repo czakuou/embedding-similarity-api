@@ -61,13 +61,13 @@ C4Container
   Person(client, "API client")
   System_Boundary(dss, "Document Similarity Service") {
     Container(api, "API", "Python 3.13, FastAPI, uvicorn", "Validation, rate limiting, backpressure, status reads. No torch in the image")
-    Container(worker, "Worker", "Python 3.13, sentence-transformers (CPU torch)", "Greedy micro-batched embeddings + pairwise similarity. N replicas")
-    ContainerDb(redis, "Redis", "Redis 7.4, AOF everysec, noeviction", "Stream = queue, hashes = analysis state with TTL, rate-limit counters")
+    Container(worker, "Worker", "Python 3.13, sentence-transformers (CPU torch)", "arq worker; greedy micro-batched embeddings + pairwise similarity. N replicas")
+    ContainerDb(redis, "Redis", "Redis 7.4, AOF everysec, noeviction", "arq queue (sorted set + job keys), hashes = analysis state with TTL, rate-limit counters")
   }
   System_Ext(prom, "Prometheus", "Metrics scraping")
   Rel(client, api, "POST / GET / DELETE /v1/similarity-analyses", "HTTPS")
-  Rel(api, redis, "MULTI (HSET + XADD), HGETALL, XLEN, rate limits", "RESP")
-  Rel(worker, redis, "XREADGROUP, XAUTOCLAIM, HSET, XACK + XDEL", "RESP")
+  Rel(api, redis, "HSET, enqueue job, HGETALL, ZCARD, rate limits", "RESP")
+  Rel(worker, redis, "arq polling and job bookkeeping, HGETALL, HSET", "RESP")
   Rel(prom, api, "GET /metrics")
   Rel(prom, worker, "GET :9100/metrics")
 ```
@@ -77,16 +77,16 @@ C4Container
 ```mermaid
 C4Component
   title Components: Worker
-  ContainerDb(redis, "Redis", "Stream + hashes")
+  ContainerDb(redis, "Redis", "arq queue + hashes")
   Container_Boundary(worker, "Worker") {
-    Component(slice, "worker.py", "vertical slice", "Consumer loop, greedy batching, per-item isolation, attempts, reclaim, heartbeat, SIGTERM; pure decisions + Redis stream calls in one file")
+    Component(slice, "worker/", "vertical slice", "arq job (attempts, retry, record writes), Batcher (greedy batching, per-item isolation), arq wiring (startup, queue metrics, health key, SIGTERM grace)")
     Component(kernel, "analysis.py", "shared kernel", "Record schema, key names, status transitions, expiry math (contract with the API)")
     Component(encoder, "encoder.py", "sentence-transformers", "all-MiniLM-L6-v2, pinned revision, warmed up at start; only torch import")
     Component(metrics, "observability.py", "prometheus_client, structlog", "Exposes :9100/metrics, JSON logs")
   }
   Rel(slice, kernel, "Transitions, keys, expiry")
   Rel(slice, encoder, "encode(texts)")
-  Rel(slice, redis, "XREADGROUP, XAUTOCLAIM, HSET, XACK + XDEL", "RESP")
+  Rel(slice, redis, "arq polling and job bookkeeping, HGETALL, HSET", "RESP")
   Rel(slice, metrics, "Observes")
 ```
 
@@ -108,16 +108,17 @@ sequenceDiagram
     A-->>C: 429 + Retry-After (jittered)
   end
   A->>A: validate (.txt, size, UTF-8, query) and pre-cut to 4096 chars
-  A->>R: XLEN (queue depth)
+  A->>R: ZCARD (queue depth)
   alt depth >= MAX_QUEUE_DEPTH
     A-->>C: 503 + Retry-After (jittered)
   end
-  A->>R: MULTI: HSET analysis:{id} status=queued, EXPIREAT, XADD stream
+  A->>R: HSET analysis:{id} status=queued, EXPIREAT
+  A->>R: enqueue job (arq, job id = analysis id)
   A-->>C: 202 + Location + Retry-After + expires_at
-  W->>R: XREADGROUP COUNT=32 BLOCK=5000
-  W->>R: HINCRBY attempts, HSET status=processing
-  W->>W: encode batch, pairwise similarity
-  W->>R: HSET status=done, result; XACK + XDEL
+  W->>R: arq polls and starts jobs (up to 2 x BATCH_MAX_SIZE in flight)
+  W->>R: HSET status=processing, attempts = job try
+  W->>W: Batcher collects up to BATCH_MAX_SIZE jobs, encodes them in one call (thread), pairwise similarity
+  W->>R: HSET status=done, result (+ EXPIREAT); arq removes the job
   C->>A: GET /v1/similarity-analyses/{id}
   A->>R: HGETALL analysis:{id}
   A-->>C: 200 {status: done, result: [0.87]}
@@ -126,9 +127,9 @@ sequenceDiagram
 **Step by step:**
 1. FastAPI receives and parses the whole multipart body before the handler runs; the handler then checks the per-client rate limit, so a `429` is returned only after the upload has been received (§16 item 11).
 2. It validates the file (extension, size via a capped read of the received upload -- there is no `Content-Length` check, strict UTF-8 decode, non-empty) and the query, then pre-cuts the document to `MAX_DOC_CHARS`.
-3. It checks queue depth (`XLEN`). Above `MAX_QUEUE_DEPTH` it returns `503`; the limit is soft (check-then-add is not atomic, see §11).
-4. It writes the analysis record and the stream message **in one `MULTI` transaction**, so there is never a status without a message or vice versa.
-5. Workers pull greedily (up to `BATCH_MAX_SIZE`), increment `attempts` **before** computing, embed queries and documents in one call, compute similarity pairwise, write results, then `XACK` + `XDEL`.
+3. It checks queue depth (`ZCARD` of the arq queue). Above `MAX_QUEUE_DEPTH` it returns `503`; the limit is soft (check-then-add is not atomic, see §11).
+4. It writes the analysis record, then enqueues the job (arq `enqueue_job`, job id = analysis id, JSON payload `analysis_id, document, query`). Two commands, not one transaction: the record goes first, so a worker never sees a job without a record; if enqueueing fails the record is deleted (§16 item 22).
+5. arq starts the job and the worker records `attempts` = arq's try counter **before** computing; the `Batcher` groups waiting jobs (up to `BATCH_MAX_SIZE`), embeds queries and documents in one call, computes similarity pairwise, and the job writes the result; arq then removes the job.
 6. The client polls `GET` guided by `Retry-After`; terminal states carry `result` or `error`.
 
 ### 3.5 Code structure: vertical slices, flat, functional
@@ -138,14 +139,14 @@ src/similarity/
 ├── submit/           # POST slice, split into a package once submit.py passed ~300 lines:
 │   ├── validation.py #   pure: filename/UTF-8/query checks, pre-cut
 │   ├── outcomes.py    #   sum type Accepted|RateLimited|QueueFull|Invalid -> HTTP response
-│   ├── enqueue.py      #   I/O: rate limit, queue depth, MULTI enqueue
+│   ├── enqueue.py      #   I/O: rate limit, queue depth, record write + arq enqueue
 │   └── router.py       #   FastAPI route
 ├── results.py        # GET + DELETE slice: route, 404 / 410 / 409 decisions, reads and deletes
-├── worker/            # worker slice, split into a package for the same reason:
-│   ├── items.py        #   pure: parse stream messages, attempt-overflow decisions
-│   ├── batch.py         #   pure decisions + Redis I/O: one batch end to end
-│   ├── loop.py          #   the consumer loop: read, reclaim, heartbeat, SIGTERM
-│   └── main.py          #   entrypoint: load settings, load + warm up the model, run the loop
+├── worker/            # worker slice, a package on top of the arq library:
+│   ├── jobs.py         #   the arq job `analyze`: attempts, retry, record writes
+│   ├── batcher.py       #   greedy micro-batching in front of the encoder
+│   ├── app.py           #   arq wiring: startup/shutdown, queue metrics, Worker kwargs
+│   └── entrypoint.py    #   `ArqSettings` that `arq` loads (real encoder, env settings)
 ├── encoder.py        # Encoder Protocol + sentence-transformers implementation (the only torch import)
 ├── analysis.py       # shared kernel: record schema, Redis key names, statuses + transition(),
 │                     # UUIDv7 / expiry math
@@ -161,7 +162,7 @@ scripts/
 └── benchmark.sh
 tests/
 ├── test_submit_validation.py  test_submit_enqueue.py  test_results.py
-├── test_worker_items.py  test_worker_batch.py  test_analysis.py  test_capacity.py
+├── test_worker_batcher.py  test_worker_jobs.py  test_analysis.py  test_capacity.py
 ├── test_config.py  test_api_no_torch.py
 └── behavior/        # scenarios from BEHAVIOR.md, run against the real model (see §16 item 9)
 ```
@@ -272,9 +273,9 @@ curl -i -X DELETE http://localhost:8000/v1/similarity-analyses/<id> -H "X-Client
 
 ```mermaid
 stateDiagram-v2
-  [*] --> queued: POST accepted (MULTI: record + message)
-  queued --> processing: worker picks message (attempts += 1)
-  processing --> processing: item failed or worker crashed, reclaimed after VISIBILITY_TIMEOUT_S (attempts += 1)
+  [*] --> queued: POST accepted (record written, then job enqueued)
+  queued --> processing: worker starts the job (attempts = arq's try counter)
+  processing --> processing: compute failed (retried after VISIBILITY_TIMEOUT_S) or worker crashed (job restarted after VISIBILITY_TIMEOUT_S + 10 s)
   processing --> done: similarity computed
   processing --> failed: attempts reached MAX_ATTEMPTS
   done --> [*]: TTL expires (410) or DELETE (404)
@@ -283,13 +284,14 @@ stateDiagram-v2
 
 | Mechanism | Rule | Why |
 |---|---|---|
-| Attempt counting | `HINCRBY attempts 1` **before** computing | A worker killed mid-batch (e.g. OOM killer) never reaches an `except` block. Counting at start guarantees a "message that kills workers" stops after `MAX_ATTEMPTS` |
-| Attempt overflow | Message reclaimed with `attempts > MAX_ATTEMPTS` → `failed` without computing | Poison circuit breaker |
-| Batch failure | Exception on the whole batch → re-run items one by one; successes → `done`, failures stay un-acked | One bad document must not fail 31 good ones. Covers exceptions only: a worker crash counts an attempt for the whole batch, which is reclaimed together (§16 item 14) |
-| Redelivery | `XAUTOCLAIM` every `RECLAIM_INTERVAL_S` for messages idle > `VISIBILITY_TIMEOUT_S` | Crashed or failed items return to the pool; the timeout also acts as a natural backoff |
-| Duplicate work | Possible if a batch outlives `VISIBILITY_TIMEOUT_S` | Same score (deterministic), wastes CPU, and the slower worker's write is unconditional, so it can overwrite `attempts` or recreate a deleted record (§16 item 14); the timeout is set from the measured p95 batch time |
-| Expiry invariant | Writes of the full record re-apply `EXPIREAT = id_time + RESULT_TTL_S`; the attempts increment (`HINCRBY` + `HSET`, two round-trips) does not | If the record expires between the existence check and the increment, a hash without TTL or required fields is created and `GET` returns `500` (§16 item 14) |
-| Missing record | Worker skips (and acks) messages whose record no longer exists at batch start | Checked once, before computing; a record deleted while its batch runs is written again (§16 item 14) |
+| Attempt counting | arq increments a per-job try counter each time it **starts** the job, including a start that ends in a crash; `analyze` writes it as `attempts` before computing | A worker killed mid-batch (e.g. OOM killer) never reaches an `except` block. Counting at start guarantees a "job that kills workers" stops after `MAX_ATTEMPTS` |
+| Attempt overflow | arq `max_tries = MAX_ATTEMPTS + 1`; a job started with `attempts > MAX_ATTEMPTS` → `analyze` marks it `failed` without computing | Poison circuit breaker. The extra try exists so `analyze`, not arq, ends the job: arq would drop it and leave the record `processing` |
+| Batch failure | Exception on the whole batch → the `Batcher` re-runs pairs one by one; a pair that still fails raises in its job, which raises arq `Retry(defer=VISIBILITY_TIMEOUT_S)`, or marks it `failed` on the last attempt | One bad document must not fail 31 good ones. Covers exceptions only: a worker crash counts an attempt for every job the worker held, and they restart together (§16 item 14) |
+| Redelivery | arq keeps the job in its queue until it finishes; its in-progress marker expires `VISIBILITY_TIMEOUT_S` + 10 s after the start (arq's `job_timeout` + 10 s), after which any worker may start it again | Crashed items return to the pool |
+| Job timeout | A job running longer than `VISIBILITY_TIMEOUT_S` (including the wait for its batch) is cancelled by arq, logged as failed and not retried | Bounds a stuck job; the record stays `processing` until its TTL (§16 item 22) |
+| Duplicate work | Possible if a worker stalls past the in-progress marker's expiry | Same score (deterministic), wastes CPU, and the slower worker's write is unconditional, so it can overwrite `attempts` or recreate a deleted record (§16 item 14) |
+| Expiry invariant | Every record write is one transaction of `HSET` + `EXPIREAT = id_time + RESULT_TTL_S`; `EXPIREAT` with a time in the past deletes the key | A record that expired in the meantime is not left behind without a TTL |
+| Missing record | `analyze` returns without writing when the record no longer exists at job start | Checked once, before computing; a record deleted while its job runs is written again (§16 item 14) |
 | Client-facing error | `{code: PROCESSING_FAILED, message, attempts}` | Stack traces only in logs, correlated by `analysis_id` (`batch_id` not implemented, §16 item 6) |
 
 Worker-side exponential backoff is **not** implemented: the function is deterministic, so waiting longer does not fix a content-related failure (see TODO).
@@ -305,26 +307,29 @@ Worker-side exponential backoff is **not** implemented: the function is determin
 | 0 | uvicorn `--limit-concurrency` | API flooding | `503` (`text/plain`, no `Retry-After`) | None in the app; counts `/health` too |
 | 1 | Per-client rate limit (`limits` library, Redis storage, fixed window), first check in the handler | One client consuming all capacity | `429` + `Retry-After` | Whole body already received and parsed (§16 item 11), plus 1 Redis round-trip |
 | 2 | Input validation incl. capped read (limit + 1 byte) of the parsed upload | API OOM from huge uploads | `413` / `415` / `422` | Whole body already received; no `Content-Length` check (§16 item 11) |
-| 3 | Queue depth limit (`XLEN >= MAX_QUEUE_DEPTH`) | Broker growth and broken SLA | `503` + `Retry-After` | 1 Redis round-trip |
+| 3 | Queue depth limit (`ZCARD` of the arq queue `>= MAX_QUEUE_DEPTH`) | Broker growth and broken SLA | `503` + `Retry-After` | 1 Redis round-trip |
 
 `Retry-After = base + uniform(0, base)` seconds, so clients rejected in the same second do not come back in the same second (thundering herd). The README recommends clients use exponential backoff with full jitter.
 
 ### 6.2 Greedy micro-batching
 
-- `XREADGROUP COUNT=BATCH_MAX_SIZE BLOCK=READ_BLOCK_MS` returns as soon as **at least one** message is available and takes up to `BATCH_MAX_SIZE`. No timer waits for a batch to fill.
-- Low traffic: batch size ≈ 1, latency like no batching. High traffic: batches fill naturally, throughput like full batching.
-- Queries and documents are encoded in one call (`sentence-transformers` sorts by length internally to reduce padding).
+- arq runs one job per analysis (up to `2 × BATCH_MAX_SIZE` at once, so the next batch collects while the current one encodes). Each job hands its (query, document) pair to the worker's `Batcher`, which takes whatever is waiting, up to `BATCH_MAX_SIZE`.
+- If the batch is not full, the `Batcher` waits once for `BATCH_LINGER_MS` (default 10 ms) and takes what arrived meanwhile; a full batch is flushed at once. There is no fill-and-wait timer beyond that single linger.
+- Low traffic: batch size ≈ 1 and a lone analysis waits for arq's poll (`POLL_DELAY_S`) plus the linger. High traffic: batches fill, throughput like full batching.
+- The batch is encoded in a worker thread (`asyncio.to_thread`), so arq's polling and health check keep running during inference.
+- Queries and documents are encoded in one interleaved call (`sentence-transformers` sorts by length internally; at batch sizes up to 16 short queries are padded to document length; measured in the README's capacity section).
 - Similarity is computed **pairwise** (query *i* with document *i*), not as an N×N matrix: `similarity_pairwise` if available in the installed version, otherwise the diagonal of `similarity()`.
-- Results are written with one pipeline per batch; `XACK` and `XDEL` take multiple IDs.
+- Each job writes its own record (one transaction of `HSET` + `EXPIREAT`).
 
-### 6.3 Redis Streams pitfalls handled
+### 6.3 Redis pitfalls handled
 
 | Pitfall | Consequence | Handling |
 |---|---|---|
-| Acked entries stay in the stream | `XLEN` grows forever: false "queue full" and unbounded RAM | `XDEL` after `XACK`, so `XLEN` = outstanding work |
-| `XADD MAXLEN` looks like a queue limit | Silently trims the oldest **accepted** jobs | Never used. Limit enforced in the API before `XADD` |
+| Finished jobs stay in the queue | Queue depth grows forever: false "queue full" and unbounded RAM | arq removes a job's queue entry and keys when it finishes (`keep_result=0`: no result copy is kept), so `ZCARD` = queued + retrying + running jobs |
+| A queue length cap trims old entries | Silently trims the oldest **accepted** jobs | Not used. Limit enforced in the API before enqueueing |
 | `maxmemory-policy volatile-lru` (common managed default) | Evicts keys with TTL, i.e. our analyses | `noeviction` is set, but `maxmemory` is not, so the policy never triggers: Redis grows until the host's OOM killer stops it; with a limit, OOM errors would surface as `500`, not `503` (§16 item 15) |
 | Torch thread oversubscription | Torch sees host cores, not the container CPU limit; throughput drops under cgroup throttling | Compose sets `OMP_NUM_THREADS=2` (= its CPU limit), which torch reads at start-up; `TORCH_NUM_THREADS` is not applied by the worker (§16 item 16) |
+| Unpickling data read from Redis | Anyone who can write to Redis could run code in a worker | Jobs are serialised as JSON (`serialize_job`), not arq's default pickle |
 
 ### 6.4 Overload behaviour summary
 
@@ -352,7 +357,7 @@ Overload from rate limit, input size and queue depth ends in an explicit respons
 
 ### 7.2 Worked example (illustrative only)
 
-With `T = 49 emb/s` per replica, measured inside the worker image (Linux arm64, `--cpus 2`, measured by reviewer on an Apple M3 Pro under Colima; §16 item 20), maximum acceptable wait 5 s (assumed):
+With `T = 49 emb/s` per replica, measured inside the worker image (Linux arm64, `--cpus 2`, measured on an Apple M3 Pro under Colima; §16 item 20), maximum acceptable wait 5 s (assumed):
 
 | Requests/day | Peak emb/s | Replicas (`ceil(x / 34.3) + 1`) | Queue limit |
 |---|---|---|---|
@@ -367,12 +372,32 @@ A native macOS run (`T` ≈ 768 emb/s) gives 2 / 2 / 2 / 4 replicas and is not r
 
 | Quantity | Status | How |
 |---|---|---|
-| `T` for batch 1 / 8 / 16 / 32 / 64 | Measured | `scripts/benchmark.sh` → `benchmark.py` inside the worker container with the same CPU limit: best `T` = 49 emb/s (measured by reviewer). The README first sized replicas from a native macOS run instead (§16 item 20) |
+| `T` for batch 1 / 8 / 16 / 32 / 64 | Measured | `scripts/benchmark.sh` → `benchmark.py` inside the worker container with the same CPU limit: best `T` = 49 emb/s (measured on Apple M3 Pro under Colima). The first sizing used a native macOS run instead (§16 item 20) |
 | p50 / p95 batch latency | Measured | Same script; sets `BATCH_MAX_SIZE` and `VISIBILITY_TIMEOUT_S` |
 | Query (~5 tokens) vs document (256 tokens) cost | Measured | Two input sets |
 | Peak factor, length distribution, record size | Assumed | See §2 |
 
-`benchmark.py` prints the replica table for 100k / 500k / 1M / 5M requests/day from the measured `T`. **Results are local; repeat on the target SKU before sizing production.**
+`benchmark.py` prints the replica table for 100k / 500k / 1M / 5M requests/day from the measured `T`. **Results are local; repeat on the hardware you will run on before sizing.**
+
+### 7.4 Measurements (Apple M3 Pro, CPython 3.13, 2 torch threads, 10 iterations after 3 warm-up)
+
+Query ~5 tokens, document 4 096 chars; `T = batch × 2 / p50`.
+
+| Batch | Worker image, Linux arm64, `--cpus 2` (Colima): p50 / p95 ms | `T` emb/s | Native macOS arm64: p50 / p95 ms | `T` emb/s |
+|---|---|---|---|---|
+| 1 | 74.3 / 76.7 | 26.9 | 8.5 / 8.7 | 234.0 |
+| 8 | 632.4 / 639.2 | 25.3 | 40.5 / 42.1 | 395.3 |
+| 16 | 1 313.3 / 1 334.5 | 24.4 | 77.2 / 78.0 | 414.7 |
+| 32 | 1 341.1 / 1 353.6 | 47.7 | 84.3 / 85.8 | 759.6 |
+| 64 | 2 613.1 / 2 678.7 | 49.0 | 166.7 / 171.7 | 768.1 |
+
+- Native columns were measured during implementation and reproduced within 6 % (757.1 emb/s at batch 32). The worst p95 batch time in the worker image is 2.7 s (batch 64), below `VISIBILITY_TIMEOUT_S = 30`.
+- **Why the two differ by ~15×: not established.** The images are native arm64, so no CPU emulation is involved. One difference is measured: the BLAS backend is Apple Accelerate natively and OpenBLAS in the Linux image (`torch.__config__.show()`). Colima's virtualisation overhead and threading inside a CPU-limited container were not isolated. The worker-image figure is the closer proxy for a Linux deployment, so sizing uses it.
+- **Why `T` roughly doubles from batch 16 to 32:** padding. Queries and documents are encoded in one interleaved list; `sentence-transformers` sorts it by length and encodes in internal batches of 32 texts, so up to batch 16 each short query shares an internal batch with documents and is padded to document length. At batch 16, interleaved encoding took 76.7 ms vs 45.6 ms with queries and documents encoded separately (×1.68 natively, ×2.13 in the worker image); at batch 32 there was no difference. The table reflects the interleaved code path as it is today.
+- Replica table at `T` = 49.0 (§7.2). With the native `T` = 768.1 the same formula gives 2 / 2 / 2 / 4 replicas and queue limits 3 841 / 3 841 / 3 841 / 7 681. The first three limits are identical because `max_queue_depth` depends only on the replica count and `T` (`replicas × T/2 × wait`, rounded up) and all three rows need 2 replicas; the formula has no floor.
+- Defaults: compose runs 2 replicas and `MAX_QUEUE_DEPTH = 1000`; at `T` = 49 a full queue is `1000 / (2 × 49/2) ≈ 20 s` of waiting against the 5 s target (assumed); the formula gives a limit of 245 for 2 replicas.
+- Overload measurements (same machine): 300 MB upload → `413` only after all 300 MB was sent; client over its rate limit + 300 MB upload → `429` after 0.93 s, also after the full upload; 3 000 rate-limited POSTs at concurrency 50 → p99 42 ms (`ab`); API container memory 53 MiB after these tests; 1 500 concurrent POSTs (concurrency 300), workers stopped → exactly 1 000 accepted, queue 1 000 (overshoot 0, one API replica; several replicas not measured); about 1 000 queued analyses drained by two workers in 7-8 s including start-up, batches averaging ~30 of 32.
+- Failure measurements (same machine): `SIGKILL` of one worker with 300 analyses in flight → the 64 it held restarted on the other worker ~40 s later (`VISIBILITY_TIMEOUT_S` + 10 s), all 300 `done`, 64 with `attempts = 2`; `docker compose stop worker` with 300 in flight → 6.0 s, both exit 0, all `done` with `attempts = 1`; with `SHUTDOWN_GRACE_S = 8` one worker was still shutting down at Docker's 10 s limit and exited 137; Redis killed → `500 text/plain` from `POST`/`GET`, `/ready` 503, one of two workers exited 1 once Redis returned; Redis paused → `POST` hangs > 30 s, `/ready` > 20 s.
 
 ---
 
@@ -382,7 +407,7 @@ A native macOS run (`T` ≈ 768 emb/s) gives 2 / 2 / 2 / 4 replicas and is not r
 
 | Question | Metric | Type | Where |
 |---|---|---|---|
-| How long did analyses wait before their batch started? (timestamp taken before inference, so not the time-to-result SLA; §16 item 18) | `analysis_end_to_end_seconds` | histogram | worker |
+| Are we meeting the SLA (p95 < 5 s)? (creation → result written, so queue wait, batching and inference) | `analysis_end_to_end_seconds` | histogram | worker |
 | Are we keeping up? | `queue_depth` | gauge | worker |
 | How long has the oldest job been waiting? | `queue_oldest_age_seconds` | gauge | worker |
 | How many requests per handler and status class? (`status` grouped as `2xx`/`4xx`/`5xx`, so the rejection reason is not visible; uvicorn's `503`s not counted; §16 item 18) | `http_requests_total{handler, method, status}` | counter | API (instrumentator) |
@@ -393,7 +418,7 @@ A native macOS run (`T` ≈ 768 emb/s) gives 2 / 2 / 2 / 4 replicas and is not r
 | Is something failing repeatedly? | `analysis_retries_total` | counter | worker |
 | How many analyses had their document pre-cut by the API? (the model's 256-token truncation is not counted; §16 item 13) | `documents_truncated_total` | counter | worker |
 
-- **`queue_oldest_age_seconds` is the primary alert signal**: depth says *how much*, age says *how long the client waits*. It is free: a stream entry ID is a millisecond timestamp (`XRANGE - + COUNT 1`).
+- **`queue_oldest_age_seconds` is the primary alert signal**: depth says *how much*, age says *how long the oldest unfinished job has waited*. It is free: arq's queue is a sorted set scored by the time a job becomes runnable (its enqueue time in ms), so `ZRANGE 0 0 WITHSCORES` returns the oldest job. Jobs stay in the set while they run, so a job stuck on a dead worker keeps the age growing; a job deferred for a retry has a future score and counts as age 0. The worker refreshes both queue gauges once a second.
 - **`client_id` is never a metric label** (unbounded cardinality would bloat Prometheus RAM). It is not logged either (§16 item 19).
 
 ### 8.2 Logs
@@ -407,9 +432,9 @@ Key events: `analysis.accepted`, `analysis.rejected{reason}`, `batch.processed`,
 | Container | Startup | Liveness | Readiness |
 |---|---|---|---|
 | API | — | `/health` (no dependencies) | `/ready` (Redis `PING`) |
-| Worker | Heartbeat file written after each loop iteration (the first one after model load + warm-up encode) | **Not implemented**: nothing reads the heartbeat and the image has no `HEALTHCHECK` (§16 item 17) | None: the worker pulls work, nobody routes traffic to it |
+| Worker | arq's health-check key appears once the worker is polling (after model load + warm-up encode); the image's `HEALTHCHECK` has `--start-period=60s` | `arq --check` (image `HEALTHCHECK`): fails once the key, refreshed every 15 s from the polling loop, has expired | None: the worker pulls work, nobody routes traffic to it |
 
-Liveness never checks Redis: a Redis blip would otherwise restart every API replica at once (restart storm) without fixing Redis. The heartbeat is updated on every loop iteration, including empty reads, so an idle worker would never look dead -- but no probe reads it yet (§16 item 17). `/health` is counted by `--limit-concurrency`, so under a flood it can return `503` like any other request.
+Liveness never checks Redis: a Redis blip would otherwise restart every API replica at once (restart storm) without fixing Redis. The worker's key is refreshed by arq's polling loop, including when the queue is empty, so an idle worker never looks dead; it shows that the loop is alive and Redis reachable, not that a job is progressing. `/health` is counted by `--limit-concurrency`, so under a flood it can return `503` like any other request.
 
 ---
 
@@ -417,7 +442,7 @@ Liveness never checks Redis: a Redis blip would otherwise restart every API repl
 
 | Data | Where | Lifetime |
 |---|---|---|
-| Document text (pre-cut) and query | Stream message only | Until `XACK` → `XDEL` |
+| Document text (pre-cut) and query | arq job payload only (`arq:job:{id}`, JSON) | Until the job finishes (arq deletes the key; `keep_result=0`) |
 | Status, result, error, attempts, timestamps, owner `client_id` | Hash `analysis:{id}` | 24 h from creation (`EXPIREAT` derived from the UUIDv7 timestamp) |
 | Logs | stdout → log platform | Platform policy; no content or query |
 
@@ -440,8 +465,7 @@ Environment variables only, validated at start-up with `pydantic-settings` (bad 
 | `REDIS_URL` | `redis://redis:6379/0` | Queue + state |
 | `LOG_LEVEL` | `INFO` | |
 | `RESULT_TTL_S` | `86400` | Retention |
-| `STREAM_KEY` | `analyses:jobs` | Stream name |
-| `CONSUMER_GROUP` | `workers` | Consumer group |
+| `QUEUE_NAME` | `arq:queue` | arq queue (a Redis sorted set) |
 
 ### API
 
@@ -462,17 +486,16 @@ Environment variables only, validated at start-up with `pydantic-settings` (bad 
 | Variable | Default | Purpose | Value source |
 |---|---|---|---|
 | `BATCH_MAX_SIZE` | `32` | Greedy micro-batch cap | **From benchmark** |
-| `READ_BLOCK_MS` | `5000` | `XREADGROUP BLOCK` | Assumed |
-| `VISIBILITY_TIMEOUT_S` | `30` | `XAUTOCLAIM` idle threshold (> p95 batch time) | **From benchmark** |
-| `RECLAIM_INTERVAL_S` | `10` | How often to look for abandoned messages | Assumed |
+| `BATCH_LINGER_MS` | `10` | How long a non-full batch waits once for more jobs | Assumed |
+| `POLL_DELAY_S` | `0.1` | How often arq looks for new jobs | Assumed |
+| `VISIBILITY_TIMEOUT_S` | `30` | arq job timeout (> p95 batch time) and the delay before a failed attempt is retried; a job whose worker died restarts after this + 10 s | **From benchmark** |
+| `SHUTDOWN_GRACE_S` | `5` | How long arq waits for in-flight jobs on `SIGTERM` (arq 0.25 waits it in full); keep below the orchestrator's stop timeout minus the longest batch | Assumed |
 | `MAX_ATTEMPTS` | `3` | Retry cap | Assumed |
 | `TORCH_NUM_THREADS` | `2` | **Defined, not wired** in the worker; only `benchmark.py` applies it (§16 item 16) | — |
 | `OMP_NUM_THREADS` | not a setting; `2` in compose | Torch's thread count in the worker; = container CPU limit | **From deployment** |
-| `HEARTBEAT_PATH` | `/tmp/worker-heartbeat` | Heartbeat file; nothing reads it (§16 item 17) | — |
-| `HEARTBEAT_MAX_AGE_S` | `30` | **Defined, not wired**: only used by the start-up invariant (§16 item 17) | Assumed |
 | `METRICS_PORT` | `9100` | Worker `/metrics` | — |
 
-**Start-up invariants:** `HEARTBEAT_MAX_AGE_S > 2 × READ_BLOCK_MS / 1000`; `MAX_DOC_CHARS <= MAX_FILE_SIZE_BYTES`; `MAX_ATTEMPTS >= 1`.
+**Start-up invariants:** `MAX_DOC_CHARS <= MAX_FILE_SIZE_BYTES`; `MAX_ATTEMPTS >= 1`.
 
 ---
 
@@ -484,29 +507,29 @@ Environment variables only, validated at start-up with `pydantic-settings` (bad 
 | API style | REST, domain resource `similarity-analyses`, Richardson level 2 + `links.self` | `/jobs`; full HATEOAS; `303` to a result sub-resource | Domain name hides the queue as an implementation detail. A separate resource for an 8-byte result is an extra round-trip for nothing |
 | Process split | API (no torch) + worker | Thread pool; process pool in one container | A stuck worker cannot freeze health checks; each part scales on its own bottleneck |
 | Backing service | Redis for queue, state, rate limits | Service Bus (+ emulator); Postgres `SKIP LOCKED`; RabbitMQ | See **ADR-001** |
-| Queue library | Own Streams consumer (the `worker/` package, ~580 lines including batch processing; §16 item 21) | Celery / RQ / arq | Libraries hide exactly what is being evaluated (acks, redelivery, depth) |
-| Batching | Greedy (take what is waiting, ≤ 32) | None; fill-and-wait | Self-tuning: no latency penalty at low load |
-| Retry | Fixed visibility timeout, 3 attempts | Exponential backoff in worker | Deterministic function: waiting longer fixes nothing. Jitter is applied where the herd forms: client `Retry-After` |
+| Queue library | `arq` (async, Redis-only), pinned to 0.25.0 (§16 item 22) | Own Streams consumer (an earlier version, ~580 lines in `worker/`); Celery; RQ; Dramatiq | arq provides redelivery after a crash, retries, a try counter, graceful shutdown and a health-check key, so none of that is hand-written. Celery is heavy and prefork-oriented (one torch model per process); RQ forks per job; Dramatiq has no async. Costs: no batching in arq (our `Batcher`, ~100 lines), polling latency, newer releases need `redis<6`, record and job written in two steps |
+| Batching | Greedy `Batcher` in the worker: takes the jobs waiting, ≤ `BATCH_MAX_SIZE`, lingers once for `BATCH_LINGER_MS` if not full | None; long fill-and-wait | Batch 32 gave ~2× the throughput of batch 1 in the worker image (47.7 vs 26.9 emb/s, measured); the linger costs a lone analysis ~10 ms |
+| Retry | arq `Retry` after a fixed `VISIBILITY_TIMEOUT_S`, 3 attempts | Exponential backoff in worker | Deterministic function: waiting longer fixes nothing. Jitter is applied where the herd forms: client `Retry-After` |
 | Rate limiting | `limits` library, fixed window | Hand-written; token bucket (Lua) | Ready tool; up to 2× burst at window edges is acceptable for a PoC |
-| Queue limit | Soft (`XLEN` then `XADD`) | Atomic Lua check-and-add | Overshoot ≤ number of concurrent POSTs; acceptable |
+| Queue limit | Soft (`ZCARD` then enqueue) | Atomic Lua check-and-add | Overshoot ≤ number of concurrent POSTs; acceptable |
 | Retention | TTL from creation, `410` from UUIDv7 | Tombstones; TTL from completion | Zero extra storage; `expires_at` known up front |
 | Model delivery | Baked into image, pinned revision | Download at start; mount from storage | No runtime dependency on Hugging Face during scale-out; reproducible |
 | Observability | Prometheus + JSON logs + `analysis_id` correlation | OpenTelemetry + collector | Same diagnostic value at a fraction of the setup; OTel → TODO |
-| Tests | Fake encoder + real Redis (testcontainers) | Mock Redis (fakeredis); real model in tests | Correctness relies on real Redis semantics; the model is measured separately |
+| Tests | Fake encoder (unit tests of the `Batcher` and the job) + real Redis (testcontainers) | Mock Redis (fakeredis); real model in tests | Correctness relies on real Redis semantics; the model is measured separately |
 | Code organisation | Vertical slices, flat (one file per feature) + small shared kernel | Layers (`domain/`, `application/`, `adapters/`) | Code is organised around change: a feature lives in one file. Accepted cost: some repetition between slices; the only shared module is the API ↔ worker contract |
 | Paradigm | Pure functions + I/O handler at the end of each file | Service classes + DI container | Decisions are testable without infrastructure; side effects stay at the edge of each slice |
 
 ### ADR-001: Redis as the single backing service for the prototype
 
-- **Decision:** queue (Streams), analysis state (hashes with TTL) and rate-limit counters on one Redis. Production moves the queue to Azure Service Bus.
+- **Decision:** queue (arq's sorted set and job keys), analysis state (hashes with TTL) and rate-limit counters on one Redis. Production moves the queue to Azure Service Bus.
 - **Context:** 2–4 h prototype that must start with one command and be easy to reason about.
 - **Why:**
   1. One component instead of three: queue, state, TTL and rate limiting in one process; `docker compose up` starts in seconds with a small RAM footprint.
-  2. One transaction instead of a dual write: status and message are written atomically with `MULTI`. Two systems (Redis + broker) would require handling writes to two stores without a shared transaction.
+  2. One Redis for record and job: both are written to the same server, record first, so a worker never sees a job without a record; if enqueueing fails the record is deleted. The single `MULTI` of an earlier version is gone (§16 item 22): a Redis crash between the two writes leaves a `queued` record without a job, which expires with its TTL.
   3. Fast, light tests: testcontainers with only Redis.
 - **Rejected for the PoC: Service Bus emulator.** It needs a SQL Server sidecar (message state stored in SQL Server, no in-memory mode), does not persist data across container restarts, and testcontainers ships a ready-made Service Bus module for Java, Go and .NET but not Python.
-- **Accepted costs:** broker semantics that Service Bus provides natively (redelivery, delivery count, dead-lettering) are implemented by hand; local tests run against a different broker than production (dev/prod parity gap). Single-node Redis is a single point of failure; AOF `everysec` is a PoC-level durability measure.
-- **Mitigations:** broker calls are confined to the two slices: `submit/enqueue.py` (enqueue, depth) and the `worker/` package (`loop.py`: receive, reclaim, depth metrics; `batch.py`: ack + delete). Switching to Service Bus would replace the enqueue path and the worker package's queue handling; the results slice and the record schema stay. Not validated by CI (§16 item 21). TODO: run the same BDD suite against a Service Bus adapter with the emulator in CI.
+- **Accepted costs:** broker semantics that Service Bus provides natively are partly provided by arq (redelivery, try counter) and partly absent (no dead-letter queue); local tests run against a different broker than production (dev/prod parity gap). Single-node Redis is a single point of failure; AOF `everysec` is a PoC-level durability measure.
+- **Mitigations:** the broker is touched in `submit/enqueue.py` (`enqueue_job`, `ZCARD`), `worker/app.py` (arq `Worker` settings, queue metrics) and `worker/jobs.py` (`Retry`, the try counter). Switching to Service Bus would replace the enqueue path and the arq wiring; the job function, the `Batcher`, the results slice and the record schema stay. Not validated by CI (§16 item 21). TODO: run the same BDD suite against a Service Bus adapter with the emulator in CI.
 - **Revisit when:** message durability with an SLA is required, an operational DLQ is needed, multiple consumers (pub/sub) appear, or compliance requirements apply.
 
 ---
@@ -517,7 +540,7 @@ Environment variables only, validated at start-up with `pydantic-settings` (bad 
 |---|---|---|
 | API container | **Azure Container Apps** (HTTP scaling) | Scale on request rate; same image from **Azure Container Registry** |
 | Worker container | **Azure Container Apps** with **KEDA** scale rule on queue length | Scale-to-zero at night; `min/maxReplicas` from §7; KEDA threshold = `T/2 × target wait` |
-| Redis Stream | **Azure Service Bus** queue | Peek-lock = ack, `DeliveryCount` = attempts, `LockDuration` = visibility timeout, built-in DLQ with `MaxDeliveryCount`, scheduled messages for backoff. Messages up to 256 KB fit Standard tier; larger → Claim-Check with Blob Storage |
+| arq queue on Redis | **Azure Service Bus** queue | Peek-lock = ack, `DeliveryCount` = attempts, `LockDuration` = visibility timeout, built-in DLQ with `MaxDeliveryCount`, scheduled messages for backoff. Messages up to 256 KB fit Standard tier; larger → Claim-Check with Blob Storage |
 | Redis hashes | **Azure Managed Redis** (cheap hot polling reads) or **Cosmos DB with TTL** (durability) | Set eviction policy explicitly (`noeviction`); polling makes Cosmos RU cost grow |
 | Rate limiting, client identity | **Azure API Management** (`rate-limit-by-key`, `quota-by-key`, subscription keys / Entra ID) | Rejected traffic never reaches the containers; real auth replaces `X-Client-Id` |
 | Secrets | **Key Vault** references in Container Apps; later **Managed Identity** to Redis | No secrets in env files or repo |
@@ -527,6 +550,8 @@ Environment variables only, validated at start-up with `pydantic-settings` (bad 
 
 The API contract (`202` + polling) does not change; only what sits behind it does.
 
+**At 10× traffic** (5 000 000 requests/day in the replica table, §7.2): worker replicas go from 5 to 35 by the formula at `T` = 49 (worker-image measurement on a laptop; a target SKU must be measured), the soft queue limit's overshoot risk grows with concurrent request volume (making the atomic Lua check more valuable), and the per-client fixed window's 2× burst tolerance matters more in absolute request counts, though it is the same relative bound.
+
 ---
 
 ## 13. Testing strategy
@@ -534,7 +559,7 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 | Layer | What | How | Budget |
 |---|---|---|---|
 | Unit (pure) | Validation; `404` vs `410` from UUIDv7; `Retry-After` bounds; state transitions; attempt overflow → `failed`; pairwise result shape (`list[float]`, not `[[...]]`); capacity formula; config invariants | Plain pytest on the pure functions of each slice and `analysis.py`; injected clock and RNG; "API import does not load torch" check | ~20 min |
-| Behaviour (BDD) | Business scenarios in `BEHAVIOR.md`, mapped 1:1 to `test_given_..._when_..._then_...` | FastAPI `TestClient` + one iteration of the worker loop (`process_batch`) driven in-process + **real Redis via testcontainers** (session-scoped container, `FLUSHDB` between tests) + **the real pinned model**, loaded once per test session. Changed from a fake encoder during implementation (§16 item 9): these are integration tests meant to prove the service itself works, which a fake model can't do. The one scenario about a failure that "can never succeed" simulates an infrastructure-level failure via a wrapper around the real encoder, not a poisoned input. | ~60 s with the real model |
+| Behaviour (BDD) | Business scenarios in `BEHAVIOR.md`, mapped 1:1 to `test_given_..._when_..._then_...` | FastAPI `TestClient` + a real arq `Worker` in burst mode (runs until the queue is empty, including jobs deferred for a retry) driven in-process + **real Redis via testcontainers** (session-scoped container, `FLUSHDB` between tests) + **the real pinned model**, loaded once per test session. Changed from a fake encoder during implementation (§16 item 9): these are integration tests meant to prove the service itself works, which a fake model can't do. The one scenario about a failure that "can never succeed" simulates an infrastructure-level failure via a wrapper around the real encoder, not a poisoned input. | ~60 s with the real model |
 | Model | Throughput and latency, not correctness | `benchmark.py` (§7) | — |
 | Smoke | `docker compose up` + `curl` happy path | Manual / README | — |
 
@@ -542,7 +567,7 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 
 **CI (GitHub Actions):** `pre-commit run --all-files` → `pytest` (testcontainers; Docker available on Ubuntu runners) → `pip-audit` → `docker build --target api` and `--target worker`.
 
-**Not tested (deliberately):** semantic quality of the model, `/metrics` content, end-to-end load (TODO).
+**Not tested (deliberately):** semantic quality of the model, `/metrics` content, end-to-end load (TODO). **Not tested today:** responses from a real uvicorn server (the in-process `TestClient` does not surface the `DELETE` error), concurrent writes from two workers to one record, Redis failures.
 
 ---
 
@@ -559,7 +584,7 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 9. **Webhook delivery** and **long-polling** (`GET ...?wait=10`); `Idempotency-Key` on `POST`.
 10. **Worker exponential backoff with jitter**: becomes valuable when embeddings move to an external provider (e.g. Azure OpenAI / Foundry) whose errors are transient (`429`).
 11. **ONNX / OpenVINO backend with quantisation**, measured against `T`.
-12. **Dead-letter stream** for operator inspection of `failed` analyses.
+12. **Dead-letter store** for operator inspection of `failed` analyses.
 13. **Cancellation** (`queued → cancelled`), tombstone so `GET` after `DELETE` returns `410`, full HATEOAS, `pytest-bdd` if non-developers start writing scenarios.
 14. **Multi-file submissions** in one request; chunking for documents beyond the model context.
 15. **Per-tier retention**; long-term export (Blob + lifecycle management).
@@ -568,12 +593,13 @@ The API contract (`202` + polling) does not change; only what sits behind it doe
 18. **`dev` Docker target with live-reload** for local API development, instead of rebuilding the production-oriented multi-stage image on every change.
 19. **Early rejection on `Content-Length`** (and the rate limit) in ASGI middleware, before the multipart body is parsed (§16 item 11).
 20. **Redis failure handling:** `socket_timeout`, `RedisError` → `503` + `Retry-After`, worker reconnect loop and a restart policy; set `maxmemory` and map OOM errors to `503` (§16 item 15).
-21. **Record integrity:** conditional record writes in Lua (only if the record exists and is `processing`) and an atomic attempts increment that re-applies `EXPIREAT`; isolate items after a worker crash (§16 item 14).
+21. **Record integrity:** conditional record writes in Lua (only if the record exists and is `processing`); isolate items after a worker crash (§16 item 14).
 22. **Token-count-based truncation flag** in the worker (§16 item 13); **encode queries and documents separately** to avoid padding queries to document length.
 23. **Consistent error format** (Problem Details for `404`/`410`, validation errors and `500`; `Retry-After` on the concurrency-limit `503`); empty `204` for `DELETE`; reject non-v7 UUIDs and whitespace-only documents (§16 item 12).
-24. **Wire or remove dead config** (`MAX_QUERY_LENGTH`, `TORCH_NUM_THREADS`, `HEARTBEAT_MAX_AGE_S`); **worker liveness probe**; liveness path not counted by `--limit-concurrency`; exec-form API `CMD` (§16 items 16-17).
-25. **Observability fixes:** end-to-end metric and `updated_at` after inference, ungrouped status labels, uvicorn access log through structlog, `client_id` in logs (§16 items 18-19).
-26. **Supply chain and local safety:** digest-pin the Redis image, avoid the duplicated model layer, bind Redis to localhost in compose; benchmark on the target SKU with thread limits applied (§16 item 20).
+24. **Wire or remove dead config** (`MAX_QUERY_LENGTH`, `TORCH_NUM_THREADS`); liveness path not counted by `--limit-concurrency`; exec-form API `CMD` (§16 items 16-17).
+25. **Observability fixes:** ungrouped status labels, uvicorn access log through structlog, `client_id` in logs (§16 items 18-19).
+26. **arq job timeout and version:** mark an analysis `failed` (or retry it) when arq cancels its job on timeout; replace or upgrade `arq` (newer releases need `redis<6`) (§16 item 22).
+27. **Supply chain and local safety:** digest-pin the Redis image, avoid the duplicated model layer, bind Redis to localhost in compose; benchmark on the target SKU with thread limits applied (§16 item 20).
 
 ---
 
@@ -592,7 +618,7 @@ Estimates assume implementation with a coding agent **including reading and unde
 | 6 | BDD tests from `BEHAVIOR.md` (scenarios 1–7) | 25 | All behaviour tests green | Fake encoder via the `Encoder` Protocol; why real Redis |
 | 7 | `benchmark.py` + `scripts/benchmark.sh` + replica table | 15 | `T`, p95 batch, recommended config printed | Utilisation 0.7; what is measured vs assumed |
 | 8 | CI workflow | 10 | Green pipeline | CI = pre-commit + tests + audit + build |
-| 9 | README (from this SPEC): run, architecture, trade-offs, ADR-001, known limitations, "How this was built", TODO | 20 | Reviewer can run and understand | Every "why" sentence |
+| 9 | README (from this SPEC): run, architecture, trade-offs, ADR-001, known limitations, "How this was built", TODO | 20 | Reader can run and understand | Every "why" sentence |
 | | **Total** | **230** | | |
 
 
@@ -605,7 +631,7 @@ Estimates assume implementation with a coding agent **including reading and unde
 
 ## 16. Implementation notes & deviations
 
-Produced by auditing the finished code against this SPEC. Only real deviations are listed; places
+Differences between this SPEC and the implemented code. Only real deviations are listed; places
 where the code matches the design are not repeated here.
 
 | # | SPEC said | Implemented | Reason | Impact |
@@ -613,23 +639,24 @@ where the code matches the design are not repeated here.
 | 1 | Python 3.12 | Python 3.13 everywhere (`pyproject.toml`, Dockerfile, CI) | 3.13 was already available; no reason to target an older runtime | None -- a strict improvement |
 | 2 | One file per slice (§3.5) | `submit/` and `worker/` are packages (4-5 files each) | Both slices passed the ~300-line threshold that §3.5 itself sets as the trigger | None -- the rule was followed, not broken |
 | 3 | §3.5 file tree lists `dependencies.py`/`api_paths.py` nowhere | Both exist: `dependencies.py` holds the FastAPI `Depends()` getters so slices take typed `Annotated` parameters instead of reading `request.app.state`; `api_paths.py` centralises `/v1/...` path construction | Removes repeated magic strings and manual `app.state` lookups across slices | None -- both are small, single-purpose, and consistent with "shared code limited to the cross-process contract + config + observability + encoder" |
-| 4 | Test files: `test_submit.py`, `test_worker.py` (§3.5) | Split into `test_submit_validation.py`/`test_submit_enqueue.py` and `test_worker_items.py`/`test_worker_batch.py`, plus new `test_config.py`, `test_api_no_torch.py` | Mirrors the source package split (item 2); each test module maps to one source module | None |
-| 5 | §6.1 layer 0: `uvicorn --limit-concurrency` protects against API flooding | `API_CONCURRENCY_LIMIT` existed in `config.py`/`.env.example` but nothing read it until this audit found the gap; now wired into the API Dockerfile's `CMD` via shell-form env interpolation | Oversight during implementation: the setting was added to the config model but never connected to the one place that can apply it | Layer 0 is applied today, only in the Docker image (not by `make run-api`); the shell-form `CMD` makes `sh` PID 1, so `SIGTERM` does not reach uvicorn (item 17) |
+| 4 | Test files: `test_submit.py`, `test_worker.py` (§3.5) | Split into `test_submit_validation.py`/`test_submit_enqueue.py` and `test_worker_batcher.py`/`test_worker_jobs.py` (after the move to arq, item 22; earlier `test_worker_items.py`/`test_worker_batch.py`), plus new `test_config.py`, `test_api_no_torch.py` | Mirrors the source package split (item 2); each test module maps to one source module | None |
+| 5 | §6.1 layer 0: `uvicorn --limit-concurrency` protects against API flooding | `API_CONCURRENCY_LIMIT` existed in `config.py`/`.env.example` but nothing read it until the gap was found; now wired into the API Dockerfile's `CMD` via shell-form env interpolation | Oversight during implementation: the setting was added to the config model but never connected to the one place that can apply it | Layer 0 is applied today, only in the Docker image (not by `make run-api`); the shell-form `CMD` makes `sh` PID 1, so `SIGTERM` does not reach uvicorn (item 17) |
 | 6 | §8.2 log fields: `batch_id`, `duration_ms`, `error_type` | None of the three exist in any log call. `analysis_id` is logged per item; no identifier correlates items processed in the same batch | Not implemented; no record of why | **Not fixed** -- tracked as TODO §14 item 17. Reduces the ability to correlate "this batch's 32 items" in log search, and to query by duration or failure type without parsing messages |
-| 7 | §8.2: `worker.model_loaded` log event carries cold-start duration | The event is logged (`worker/loop.py`) but with no timing field; `main.py` never measures how long model load + warm-up took | Not implemented | **Not fixed** -- tracked as TODO §14 item 17. Cold-start time is currently invisible in logs/metrics |
+| 7 | §8.2: `worker.model_loaded` log event carries cold-start duration | The event is logged (`worker/app.py`) but with no timing field; startup never measures how long model load + warm-up took | Not implemented | **Not fixed** -- tracked as TODO §14 item 17. Cold-start time is currently invisible in logs/metrics |
 | 8 | §3.5: "clock and RNG are injected" | The clock is injected via `Depends()` (`ClockDep`, overridden in tests). The jitter RNG is a plain constructor argument (`random.Random()`) created fresh in `submit/router.py`'s handler and threaded through as a function argument to `decide_and_enqueue()`, not supplied via `Depends()` | `decide_and_enqueue()` takes `rng` as a parameter either way, so it is deterministic and testable without DI; the router just doesn't use the same mechanism as the clock | Cosmetic inconsistency only -- both paths are testable, but the two "injected" dependencies the rule names are injected two different ways |
 | 9 | §13: BDD scenarios use a fake encoder; real model is benchmarked separately | All 8 BEHAVIOR.md scenarios load and run the real pinned model (session-scoped fixture); the fake encoder (`tests/fake_encoder.py`) now backs only the pure unit tests of `process_batch` logic (`test_worker_batch.py`) | A fake-model "integration" test proves the plumbing works, not that the service works; decided during implementation that these tests should prove the latter | Full suite runtime grew from ~20s to ~60-70s. Scenario 5 ("poisoned document") was reframed to "an analysis that can never succeed", since a real model has no notion of a poisoned input -- it is now simulated as one analysis's embedding call raising, via a wrapper around the real encoder, not a special input string |
 | 10 | (not in original SPEC) | `Makefile` added for common dev commands (install, test variants split by the `behavior` pytest marker, lint/format/typecheck, audit, local run targets, compose lifecycle) | Convenience wrapper around commands already in use; not a design decision | None |
-| 11 | §3.4 step 1, §6.1: rate limit checked "before reading the body"; size via `Content-Length` with "no body I/O on rejection" | FastAPI parses the whole multipart body before the handler; there is no `Content-Length` check, so `429` and `413` are decided after the upload is received | Framework behaviour not accounted for in the design | Measured by reviewer: a 300 MB upload is fully received before `413`, and before `429` for a client over its limit (0.93 s). TODO §14 item 19 |
+| 11 | §3.4 step 1, §6.1: rate limit checked "before reading the body"; size via `Content-Length` with "no body I/O on rejection" | FastAPI parses the whole multipart body before the handler; there is no `Content-Length` check, so `429` and `413` are decided after the upload is received | Framework behaviour not accounted for in the design | Measured on Apple M3 Pro under Colima: a 300 MB upload is fully received before `413`, and before `429` for a client over its limit (0.93 s). TODO §14 item 19 |
 | 12 | §4: RFC 9457 for errors; §4.1: concurrency-limit `503` with `Retry-After` and `OVERLOADED` | Problem Details only from the API's own handlers; `404`/`410` have a `null` body; FastAPI's default `422` for a missing form field or malformed UUID; uvicorn's `503` and Redis `500` are `text/plain`; `DELETE` `204` is sent with a body, which logs a `RuntimeError` and closes the connection; nil UUID returns `410`; whitespace-only documents are accepted | Not handled | Clients see several error formats. TODO §14 item 23 |
-| 13 | A3: client sees `document_truncated` | The flag reflects only the 4 096-char pre-cut; the model's 256-token truncation is not reported, and `documents_truncated_total` counts only the pre-cut | Not implemented | Measured by reviewer: a 2 925-char document scored exactly like its first half, flag `false`. TODO §14 item 22 |
-| 14 | §5: every write re-applies `EXPIREAT`; missing record → no resurrection; duplicate work harmless; one bad document must not fail the batch | The attempts increment (`HINCRBY` + `HSET`) does not re-apply `EXPIREAT`; worker writes are unconditional, so a stale worker can overwrite `attempts` or recreate a deleted record; per-item isolation covers exceptions, not worker crashes | Existence checked once at batch start only | Measured by reviewer: 32 deleted analyses reappeared as `done` after a paused worker resumed. TODO §14 item 21 |
-| 15 | §6.3: `noeviction` → full memory fails writes with `503`; §6.4: never a timeout | `maxmemory` is not set, so the policy has no effect; no Redis socket timeout and no `RedisError` handler: Redis down → `500`, Redis stalled → requests and `/ready` hang; workers exit when Redis goes away and compose does not restart them | Not implemented | Measured by reviewer (`docker kill` / `docker pause` on Redis). TODO §14 item 20 |
+| 13 | A3: client sees `document_truncated` | The flag reflects only the 4 096-char pre-cut; the model's 256-token truncation is not reported, and `documents_truncated_total` counts only the pre-cut | Not implemented | Measured on Apple M3 Pro under Colima: a 2 925-char document scored exactly like its first half, flag `false`. TODO §14 item 22 |
+| 14 | §5: missing record → no resurrection; duplicate work harmless; one bad document must not fail the batch | Worker writes are unconditional (full-record `HSET`), so a stale worker can overwrite `attempts` or recreate a deleted record; the existence check happens once, at job start; per-item isolation covers exceptions, not worker crashes, and a crash restarts every job the worker held (up to `2 × BATCH_MAX_SIZE`) together | Existence checked once, before computing | Measured on Apple M3 Pro under Colima with the previous hand-written consumer: 32 deleted analyses reappeared as `done` after a paused worker resumed; not re-measured with arq. The earlier gap in the attempts increment (no `EXPIREAT`) is closed: the job's writes are `HSET` + `EXPIREAT` in one transaction. TODO §14 item 21 |
+| 15 | §6.3: `noeviction` → full memory fails writes with `503`; §6.4: never a timeout | `maxmemory` is not set, so the policy has no effect; no Redis socket timeout and no `RedisError` handler: Redis down → `500`, Redis stalled → requests and `/ready` hang; workers exit when Redis goes away and compose does not restart them | Not implemented | Measured on Apple M3 Pro under Colima (`docker kill` / `docker pause` on Redis). TODO §14 item 20 |
 | 16 | §6.3/§10: `TORCH_NUM_THREADS` = container CPU limit; §10: `MAX_QUERY_LENGTH` → `422` | The worker never applies `TORCH_NUM_THREADS` (thread count follows `OMP_NUM_THREADS`, set to 2 in compose); validation hard-codes 1 000 instead of reading `MAX_QUERY_LENGTH` | Settings added to config without a reader | Changing either setting has no effect. TODO §14 item 24 |
-| 17 | §8.3: worker liveness from heartbeat age | The heartbeat is written but nothing reads it; the worker image has no `HEALTHCHECK`. The API `CMD` is shell form, so `SIGTERM` does not reach uvicorn (stop takes ~10 s, exit 137) | Not implemented | A hung worker is not detected; API shutdown is not graceful. TODO §14 item 24 |
-| 18 | §8.1: `analysis_end_to_end_seconds` answers the SLA; `http_requests_total{handler, status}` answers "why we reject" | The end-to-end timestamp (and `updated_at`) is taken before inference; `status` is grouped (`4xx`), and uvicorn's `503`s are not counted | Library default (grouped status) and timestamp placement | Measured by reviewer: 0.058 s summed end-to-end vs 0.31 s of batch time for 28 analyses. TODO §14 item 25 |
+| 17 | §8.3: worker liveness from heartbeat age | Replaced by arq's health-check key: the worker refreshes it from its polling loop and the image's `HEALTHCHECK` runs `arq --check` (measured: both compose workers `healthy`). The API `CMD` is shell form, so `SIGTERM` does not reach uvicorn (`docker compose stop api` takes ~10 s, exit 137) | The heartbeat file was dropped with the hand-written loop | The health key shows the polling loop is alive, not that a job progresses. API shutdown is not graceful. TODO §14 item 24 |
+| 18 | §8.1: `http_requests_total{handler, status}` answers "why we reject" | `status` is grouped (`4xx`) by the instrumentator's default, and uvicorn's `503`s are not counted. `analysis_end_to_end_seconds` and `updated_at` are taken after inference | Library default | The rejection reason is only in the `analysis.rejected` log event. TODO §14 item 25 |
 | 19 | §8.1/§8.2: `client_id` goes to logs; JSON logs | `client_id` is not logged; uvicorn's access log, the model progress bar and model-loading messages are plain text | Not implemented | TODO §14 item 25 |
-| 20 | §7.3: `T` measured inside the worker container with the same CPU limit | The README first sized replicas from a native macOS run (`T` ≈ 768 emb/s) and attributed the ~15x slower container result to emulation, although the images are native arm64. Measured by reviewer inside the worker image with `--cpus 2`: `T` = 49 emb/s; the cause of the gap is not established (BLAS backend differs: Accelerate vs OpenBLAS) | Native run was faster to iterate on | Replica table recomputed from `T` = 49 (§7.2): 500k requests/day need 5 replicas, not 2. TODO §14 item 26 |
-| 21 | §11 / ADR-001: consumer of ~100 lines; broker calls in two files | The `worker/` package is ~580 lines; broker calls are in `submit/enqueue.py`, `worker/loop.py` and `worker/batch.py` | The worker slice grew into a package (item 2) | A Service Bus switch replaces the enqueue path and the worker package's queue handling; not validated by CI |
+| 20 | §7.3: `T` measured inside the worker container with the same CPU limit | The first sizing used a native macOS run (`T` ≈ 768 emb/s) and attributed the ~15x slower container result to emulation, although the images are native arm64. Measured inside the worker image with `--cpus 2`: `T` = 49 emb/s; the cause of the gap is not established (BLAS backend differs: Accelerate vs OpenBLAS) | Native run was faster to iterate on | Replica table recomputed from `T` = 49 (§7.2): 500k requests/day need 5 replicas, not 2. TODO §14 item 26 |
+| 21 | §11 / ADR-001: consumer of ~100 lines; broker calls in two files | The hand-written consumer was ~580 lines and touched Redis in `submit/enqueue.py`, `worker/loop.py` and `worker/batch.py`; superseded by item 22 | The worker slice grew into a package (item 2) | See item 22 |
+| 22 | §3.3, §5, §6, §11 / ADR-001: hand-written Redis Streams consumer (`XREADGROUP`, `XAUTOCLAIM`, own heartbeat file, record + message in one `MULTI`) | The worker is an `arq` job (`worker/jobs.py`) behind a `Batcher` (`worker/batcher.py`); arq is pinned to 0.25.0 because newer releases require `redis<6` and the project uses redis-py 7.4.1; the queue is arq's sorted set `arq:queue` (`QUEUE_NAME`); the API writes the record, then enqueues the job (two commands, record deleted if enqueueing fails); jobs are JSON, not pickle; `STREAM_KEY`, `CONSUMER_GROUP`, `READ_BLOCK_MS`, `RECLAIM_INTERVAL_S`, `HEARTBEAT_*` are gone and `BATCH_LINGER_MS`, `POLL_DELAY_S`, `SHUTDOWN_GRACE_S` are new; `VISIBILITY_TIMEOUT_S` is now arq's job timeout | Less hand-written queue code; arq supplies redelivery, retries, graceful shutdown and a health check | No single transaction for record + job; a job over `VISIBILITY_TIMEOUT_S` is cancelled by arq and not retried, leaving its record `processing`; recovery of a crashed worker's jobs takes `VISIBILITY_TIMEOUT_S` + 10 s (~40 s measured on an Apple M3 Pro, 64 jobs); up to `2 × BATCH_MAX_SIZE` jobs are held per worker; arq 0.25 waits the whole `SHUTDOWN_GRACE_S` on `SIGTERM` whenever a job is in flight. Measured on the same laptop: 1,500 concurrent POSTs → exactly 1,000 accepted; ~1,000 queued analyses drained by two workers in 7-8 s; `docker compose stop worker` under load 6.0 s, exit 0. TODO §14 item 26 |
 
-Items 1-10 do not change the API contract (§4), the job lifecycle (§5), or the capacity formula (§7). Items 11-21 record where the implementation differs from statements in §3-§11; the capacity formula (§7) is unchanged.
+Items 1-10 do not change the API contract (§4), the job lifecycle (§5), or the capacity formula (§7). Items 11-21 record where the implementation differs from statements in §3-§11; item 22 records the replacement of the hand-written consumer by arq, after which §3-§11 describe the arq-based worker. The capacity formula (§7) is unchanged.
