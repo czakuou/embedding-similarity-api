@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import pytest
-import redis.asyncio as redis
 from fastapi.testclient import TestClient
 from starlette import status
 
 from similarity.config import WorkerSettings
 from similarity.encoder import SentenceTransformerEncoder
 
-from .conftest import process_one_batch, submit_valid_document
+from .conftest import process_queue, submit_valid_document
 
 pytestmark = pytest.mark.behavior
 
 
 async def test_given_full_queue_when_submitting_then_503_and_accepted_work_completes(
     app_client: TestClient,
-    worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
     real_encoder: SentenceTransformerEncoder,
 ) -> None:
@@ -33,7 +31,7 @@ async def test_given_full_queue_when_submitting_then_503_and_accepted_work_compl
     assert 5 <= retry_after <= 10
     assert rejected.json()["code"] == "OVERLOADED"
 
-    await process_one_batch(worker_redis, worker_settings, real_encoder)
+    await process_queue(worker_settings, real_encoder)
 
     for i, analysis_id in enumerate(accepted_ids):
         poll = app_client.get(

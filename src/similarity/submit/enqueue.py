@@ -6,6 +6,7 @@ import random
 from datetime import UTC, datetime
 
 import redis.asyncio as redis
+from arq import ArqRedis
 from limits import RateLimitItem, parse
 from limits.aio.storage import RedisStorage
 from limits.aio.strategies import FixedWindowRateLimiter
@@ -13,6 +14,7 @@ from limits.storage import storage_from_string
 from uuid6 import uuid7
 
 from similarity.analysis import (
+    ANALYZE_JOB,
     AnalysisRecord,
     Status,
     analysis_key,
@@ -59,30 +61,35 @@ async def check_rate_limit(
     return await limiter.hit(item, client_id)
 
 
-async def queue_depth(redis_client: redis.Redis, stream_key: str) -> int:
+async def queue_depth(redis_client: redis.Redis, queue_name: str) -> int:
+    """Jobs queued, deferred for a retry, or in progress: arq keeps a job in this sorted set
+    until it has finished.
+    """
     # redis-py's stub returns Any here (its sync/async overloads share one signature).
-    result: int = await redis_client.xlen(stream_key)
+    result: int = await redis_client.zcard(queue_name)
     return result
 
 
 async def enqueue(
     redis_client: redis.Redis,
+    arq_pool: ArqRedis,
     *,
-    stream_key: str,
+    queue_name: str,
     client_id: str,
     document: str,
     query: str,
     document_truncated: bool,
     result_ttl_s: int,
 ) -> Accepted:
-    """Writes the analysis record and the stream message in one MULTI transaction:
-    there is never a status without a message or vice versa.
+    """Writes the analysis record, then enqueues the job. Two commands on one Redis, not one
+    transaction: the record goes first, so a worker never sees a job without a record. If
+    the enqueue fails the record is removed again.
     """
-    analysis_id = uuid7()
+    analysis_id = str(uuid7())
     created_at = datetime.now(UTC)
     expiry = expires_at(created_at, result_ttl_s)
     record = AnalysisRecord(
-        id=str(analysis_id),
+        id=analysis_id,
         client_id=client_id,
         status=Status.QUEUED,
         created_at=created_at,
@@ -91,26 +98,34 @@ async def enqueue(
     )
 
     async with redis_client.pipeline(transaction=True) as pipe:
-        pipe.hset(analysis_key(str(analysis_id)), mapping=record_to_hash(record))
-        pipe.expireat(analysis_key(str(analysis_id)), int(expiry.timestamp()))
-        pipe.xadd(
-            stream_key,
-            {
-                "analysis_id": str(analysis_id),
-                "client_id": client_id,
-                "document": document,
-                "query": query,
-                "document_truncated": int(document_truncated),
-            },
-        )
+        pipe.hset(analysis_key(analysis_id), mapping=record_to_hash(record))
+        pipe.expireat(analysis_key(analysis_id), int(expiry.timestamp()))
         await pipe.execute()
 
-    return Accepted(analysis_id=str(analysis_id), created_at=created_at, expires_at=expiry)
+    try:
+        job = await arq_pool.enqueue_job(
+            ANALYZE_JOB,
+            analysis_id,
+            document,
+            query,
+            _job_id=analysis_id,
+            _queue_name=queue_name,
+            _expires=result_ttl_s,
+        )
+    except Exception:
+        await redis_client.delete(analysis_key(analysis_id))
+        raise
+    if job is None:  # a fresh UUIDv7 collided with an existing job id
+        await redis_client.delete(analysis_key(analysis_id))
+        raise RuntimeError(f"job {analysis_id} already exists")
+
+    return Accepted(analysis_id=analysis_id, created_at=created_at, expires_at=expiry)
 
 
 async def decide_and_enqueue(
     *,
     redis_client: redis.Redis,
+    arq_pool: ArqRedis,
     limiter: FixedWindowRateLimiter,
     rate_limit: RateLimitItem,
     settings: ApiSettings,
@@ -153,14 +168,15 @@ async def decide_and_enqueue(
             reason="validation_error", detail="query must be 1-1000 chars after trimming"
         )
 
-    depth = await queue_depth(redis_client, settings.stream_key)
+    depth = await queue_depth(redis_client, settings.queue_name)
     if depth >= settings.max_queue_depth:
         return QueueFull(retry_after_s=jittered_retry_after(settings.retry_after_base_s, rng))
 
     pre_cut = pre_cut_document(document, settings.max_doc_chars)
     return await enqueue(
         redis_client,
-        stream_key=settings.stream_key,
+        arq_pool,
+        queue_name=settings.queue_name,
         client_id=validated_client_id,
         document=pre_cut.text,
         query=validated_query,

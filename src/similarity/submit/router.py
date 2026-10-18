@@ -9,7 +9,13 @@ from fastapi import APIRouter, Form, Header, UploadFile
 from fastapi.responses import JSONResponse
 
 from similarity.api_paths import SIMILARITY_ANALYSES_PATH
-from similarity.dependencies import RateLimiterDep, RateLimitItemDep, RedisDep, SettingsDep
+from similarity.dependencies import (
+    ArqDep,
+    RateLimiterDep,
+    RateLimitItemDep,
+    RedisDep,
+    SettingsDep,
+)
 from similarity.submit.enqueue import decide_and_enqueue
 from similarity.submit.outcomes import (
     Accepted,
@@ -29,6 +35,7 @@ async def submit_analysis(
     file: UploadFile,
     settings: SettingsDep,
     redis_client: RedisDep,
+    arq_pool: ArqDep,
     limiter: RateLimiterDep,
     rate_limit: RateLimitItemDep,
     query: str = Form(default=""),
@@ -39,6 +46,7 @@ async def submit_analysis(
 
     outcome = await decide_and_enqueue(
         redis_client=redis_client,
+        arq_pool=arq_pool,
         limiter=limiter,
         rate_limit=rate_limit,
         settings=settings,

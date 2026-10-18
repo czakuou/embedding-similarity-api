@@ -13,7 +13,7 @@ from similarity.config import WorkerSettings
 from similarity.dependencies import get_clock
 from similarity.encoder import SentenceTransformerEncoder
 
-from .conftest import process_one_batch, submit_valid_document
+from .conftest import process_queue, submit_valid_document
 
 pytestmark = pytest.mark.behavior
 
@@ -29,7 +29,7 @@ async def test_given_expired_analysis_when_polled_then_410(
     assert response.status_code == status.HTTP_202_ACCEPTED, response.text
     analysis_id = response.json()["id"]
 
-    await process_one_batch(worker_redis, worker_settings, real_encoder)
+    await process_queue(worker_settings, real_encoder)
     done = app_client.get(
         f"/v1/similarity-analyses/{analysis_id}", headers={"X-Client-Id": "client-a"}
     )

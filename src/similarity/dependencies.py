@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import redis.asyncio as redis
+from arq import ArqRedis
 from fastapi import Depends, Request
 from limits import RateLimitItem
 from limits.aio.strategies import FixedWindowRateLimiter
@@ -39,6 +40,11 @@ def get_redis(request: Request) -> redis.Redis:
     return client
 
 
+def get_arq_pool(request: Request) -> ArqRedis:
+    pool: ArqRedis = request.app.state.arq_pool
+    return pool
+
+
 def get_rate_limiter(request: Request) -> FixedWindowRateLimiter:
     limiter: FixedWindowRateLimiter = request.app.state.rate_limiter
     return limiter
@@ -51,6 +57,7 @@ def get_rate_limit_item(request: Request) -> RateLimitItem:
 
 SettingsDep = Annotated[ApiSettings, Depends(get_settings)]
 RedisDep = Annotated[redis.Redis, Depends(get_redis)]
+ArqDep = Annotated[ArqRedis, Depends(get_arq_pool)]
 RateLimiterDep = Annotated[FixedWindowRateLimiter, Depends(get_rate_limiter)]
 RateLimitItemDep = Annotated[RateLimitItem, Depends(get_rate_limit_item)]
 ClockDep = Annotated[Clock, Depends(get_clock)]

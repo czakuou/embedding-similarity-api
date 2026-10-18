@@ -102,7 +102,7 @@ async def test_given_invalid_input_when_submitted_then_rejected_and_not_queued(
     expected_status: int,
     expected_code: str,
 ) -> None:
-    depth_before = await small_file_redis.xlen(small_file_settings.stream_key)
+    depth_before = await small_file_redis.zcard(small_file_settings.queue_name)
 
     response = small_file_client.post(
         "/v1/similarity-analyses",
@@ -113,4 +113,4 @@ async def test_given_invalid_input_when_submitted_then_rejected_and_not_queued(
 
     assert response.status_code == expected_status, response.text
     assert response.json()["code"] == expected_code
-    assert await small_file_redis.xlen(small_file_settings.stream_key) == depth_before
+    assert await small_file_redis.zcard(small_file_settings.queue_name) == depth_before

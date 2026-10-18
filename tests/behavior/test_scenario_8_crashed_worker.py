@@ -1,55 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
+from typing import cast
 
 import pytest
 import redis.asyncio as redis
+from arq.constants import in_progress_key_prefix, retry_key_prefix
 from fastapi.testclient import TestClient
 from starlette import status
 
 from similarity.config import WorkerSettings
 from similarity.encoder import SentenceTransformerEncoder
-from similarity.worker.batch import increment_attempts
-from similarity.worker.loop import ensure_consumer_group, read_batch
 
-from .conftest import get_record, process_one_batch, submit_valid_document
+from .conftest import get_record, process_queue, submit_valid_document
 
 pytestmark = pytest.mark.behavior
 
 
-async def test_given_crashed_worker_when_message_idle_then_reclaimed_and_completed(
+async def test_given_crashed_worker_when_job_marker_expires_then_picked_up_and_completed(
     app_client: TestClient,
     worker_redis: redis.Redis,
     worker_settings: WorkerSettings,
     real_encoder: SentenceTransformerEncoder,
 ) -> None:
-    # worker_settings fixture sets visibility_timeout_s=1.
     response = submit_valid_document(app_client, "client-a")
     assert response.status_code == status.HTTP_202_ACCEPTED, response.text
     analysis_id = response.json()["id"]
 
-    # w1 reads the message (creating a pending-entry in the consumer group)
-    # and increments attempts (HINCRBY happens before computing) but crashes
-    # before ever acking it -- simulated by stopping right there.
-    await ensure_consumer_group(
-        worker_redis, worker_settings.stream_key, worker_settings.consumer_group
+    # What a worker that started the job and was then killed leaves behind: arq's
+    # in-progress marker (it expires on its own, here after 1 s instead of timeout + 10 s),
+    # the try counter at 1, and a record that says `processing`. The job stays in the queue.
+    await worker_redis.set(in_progress_key_prefix + analysis_id, b"1", px=1000)
+    await worker_redis.set(retry_key_prefix + analysis_id, 1)
+    # redis-py's stub types HSET as `Awaitable[int] | int` (see tests/behavior/conftest.py).
+    record_update = worker_redis.hset(
+        f"analysis:{analysis_id}", mapping={"status": "processing", "attempts": 1}
     )
-    crashed_items = await read_batch(
-        worker_redis,
-        stream_key=worker_settings.stream_key,
-        consumer_group=worker_settings.consumer_group,
-        consumer_name="w1",
-        batch_max_size=worker_settings.batch_max_size,
-        read_block_ms=worker_settings.read_block_ms,
-    )
-    await increment_attempts(worker_redis, crashed_items[0].analysis_id)
+    await cast("Awaitable[int]", record_update)
 
-    await asyncio.sleep(1.1)  # real VISIBILITY_TIMEOUT_S=1 must actually elapse for XAUTOCLAIM
-
-    # w2 reclaims the idle message and completes it.
-    await process_one_batch(
-        worker_redis, worker_settings, real_encoder, consumer_name="w2", force_reclaim=True
-    )
+    await asyncio.sleep(1.1)  # the marker has expired: the work is considered abandoned
+    await process_queue(worker_settings, real_encoder)
 
     record = await get_record(worker_redis, analysis_id)
     assert record.status.value == "done"

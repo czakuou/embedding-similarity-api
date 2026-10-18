@@ -62,4 +62,7 @@ ENV HF_HUB_OFFLINE=1
 
 USER 1000:1000
 EXPOSE 9100
-CMD ["python", "-m", "similarity.worker.main"]
+# arq keeps a health-check key in Redis while the worker polls; `--check` reads it.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+    CMD ["arq", "--check", "similarity.worker.entrypoint.ArqSettings"]
+CMD ["arq", "similarity.worker.entrypoint.ArqSettings"]

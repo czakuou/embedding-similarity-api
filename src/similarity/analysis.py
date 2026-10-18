@@ -1,8 +1,8 @@
 """Shared kernel: the API <-> worker contract.
 
-Record schema, Redis key names, status transitions and UUIDv7/expiry math live
-here because both processes depend on them. Nothing else is shared between
-slices.
+Record schema, Redis key names, the job contract, status transitions and
+UUIDv7/expiry math live here because both processes depend on them. Nothing else is
+shared between slices.
 """
 
 from __future__ import annotations
@@ -12,8 +12,10 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
+
+from arq.connections import RedisSettings
 
 CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -87,6 +89,26 @@ def transition(status: Status, event: Event) -> Status | IllegalTransition:
 
 def analysis_key(analysis_id: str) -> str:
     return f"analysis:{analysis_id}"
+
+
+# --- Job contract (what the API enqueues and the worker runs) ---------------
+
+ANALYZE_JOB = "analyze"
+
+
+def serialize_job(payload: Any) -> bytes:
+    """JSON instead of arq's default pickle: a worker must never unpickle bytes read
+    from Redis. `default=repr` keeps arq's bookkeeping of failed jobs serialisable.
+    """
+    return json.dumps(payload, default=repr).encode()
+
+
+def deserialize_job(raw: bytes) -> Any:
+    return json.loads(raw)
+
+
+def arq_redis_settings(redis_url: str) -> RedisSettings:
+    return RedisSettings.from_dsn(redis_url)
 
 
 # --- Record schema -----------------------------------------------------------

@@ -33,9 +33,9 @@ def configure_logging(log_level: str) -> None:
 analysis_end_to_end_seconds = Histogram(
     "analysis_end_to_end_seconds", "Time from analysis creation to a done/failed result"
 )
-queue_depth = Gauge("queue_depth", "Outstanding (unacked) messages in the analyses stream")
+queue_depth = Gauge("queue_depth", "Analysis jobs queued, deferred for a retry, or in progress")
 queue_oldest_age_seconds = Gauge(
-    "queue_oldest_age_seconds", "Age of the oldest message still in the analyses stream"
+    "queue_oldest_age_seconds", "Age of the oldest analysis job that has not finished"
 )
 inference_batch_duration_seconds = Histogram(
     "inference_batch_duration_seconds", "Wall-clock time to encode and score one batch"

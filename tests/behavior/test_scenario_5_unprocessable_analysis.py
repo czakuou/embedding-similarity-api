@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 import redis.asyncio as redis
 from fastapi.testclient import TestClient
@@ -10,7 +8,7 @@ from starlette import status
 from similarity.config import ApiSettings, WorkerSettings
 from similarity.encoder import SentenceTransformerEncoder
 
-from .conftest import ApiSettingsFactory, FailingEncoderWrapper, get_record, process_one_batch
+from .conftest import ApiSettingsFactory, FailingEncoderWrapper, get_record, process_queue
 
 pytestmark = pytest.mark.behavior
 
@@ -59,7 +57,9 @@ async def test_given_unprocessable_analysis_in_batch_when_processed_then_only_it
     )
     unprocessable_id = unprocessable_response.json()["id"]
 
-    await process_one_batch(worker_redis, worker_settings, failing_encoder)
+    # First pass: the four analyses are started once. The healthy ones finish; the
+    # unprocessable one fails its first attempt and is deferred for a retry.
+    await process_queue(worker_settings, failing_encoder, max_jobs=4)
 
     for i, analysis_id in enumerate(healthy_ids):
         poll = app_client.get(
@@ -73,12 +73,9 @@ async def test_given_unprocessable_analysis_in_batch_when_processed_then_only_it
     assert unprocessable.status.value == "processing"
     assert unprocessable.attempts == 1
 
-    # Reclaim and retry until attempts are exhausted (max_attempts=3): each
-    # retry needs the real visibility_timeout_s (1s) to actually elapse, since
-    # XAUTOCLAIM's min_idle_time is measured by Redis's own clock.
-    for _ in range(2):
-        await asyncio.sleep(1.1)
-        await process_one_batch(worker_redis, worker_settings, failing_encoder, force_reclaim=True)
+    # Keep running until the retries are used up (max_attempts=3, each retry waits the
+    # real visibility_timeout_s of 1 s before arq starts it again).
+    await process_queue(worker_settings, failing_encoder)
 
     failed = await get_record(worker_redis, unprocessable_id)
     assert failed.status.value == "failed"
@@ -87,5 +84,5 @@ async def test_given_unprocessable_analysis_in_batch_when_processed_then_only_it
     assert failed.error.attempts == 3
     assert "Traceback" not in failed.error.message
 
-    # "the message is no longer in the queue"
-    assert await worker_redis.xlen(worker_settings.stream_key) == 0
+    # "the job is no longer in the queue"
+    assert await worker_redis.zcard(worker_settings.queue_name) == 0

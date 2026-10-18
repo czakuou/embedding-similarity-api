@@ -8,12 +8,14 @@ from typing import cast
 
 import redis.asyncio as redis
 import structlog
+from arq import create_pool
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from limits.aio.strategies import FixedWindowRateLimiter
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette import status
 
+from similarity.analysis import arq_redis_settings, deserialize_job, serialize_job
 from similarity.config import ApiSettings
 from similarity.dependencies import RedisDep
 from similarity.observability import configure_logging
@@ -28,12 +30,19 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     settings = app.state.settings
     app.state.redis = redis.from_url(settings.redis_url, decode_responses=True)
+    app.state.arq_pool = await create_pool(
+        arq_redis_settings(settings.redis_url),
+        default_queue_name=settings.queue_name,
+        job_serializer=serialize_job,
+        job_deserializer=deserialize_job,
+    )
     storage = make_redis_storage(settings.redis_url)
     app.state.rate_limiter = FixedWindowRateLimiter(storage)
     app.state.rate_limit_item = rate_limit_item(settings.rate_limit)
     try:
         yield
     finally:
+        await app.state.arq_pool.aclose()
         await app.state.redis.aclose()
 
 

@@ -6,6 +6,7 @@ from typing import Any, cast
 import httpx
 import pytest
 import redis.asyncio as redis
+from arq.worker import Worker
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from testcontainers.community.redis import RedisContainer
@@ -14,8 +15,7 @@ from similarity.analysis import AnalysisRecord, analysis_key, hash_to_record
 from similarity.api import create_app
 from similarity.config import ApiSettings, WorkerSettings
 from similarity.encoder import Encoder, SentenceTransformerEncoder
-from similarity.worker.items import QueueItem
-from similarity.worker.loop import ensure_consumer_group, run_one_iteration
+from similarity.worker.app import worker_kwargs
 
 ApiSettingsFactory = Callable[..., ApiSettings]
 
@@ -126,12 +126,13 @@ def api_settings(api_settings_factory: ApiSettingsFactory) -> ApiSettings:
 def worker_settings(api_settings: ApiSettings) -> WorkerSettings:
     return WorkerSettings(
         redis_url=api_settings.redis_url,
-        stream_key=api_settings.stream_key,
-        consumer_group=api_settings.consumer_group,
+        queue_name=api_settings.queue_name,
         result_ttl_s=api_settings.result_ttl_s,
         max_attempts=3,
         visibility_timeout_s=1,
         batch_max_size=32,
+        batch_linger_ms=50,
+        poll_delay_s=0.05,
     )
 
 
@@ -155,25 +156,21 @@ async def worker_redis(worker_settings: WorkerSettings) -> AsyncIterator[redis.R
         await client.aclose()
 
 
-async def process_one_batch(
-    worker_redis: redis.Redis,
-    worker_settings: WorkerSettings,
-    encoder: Encoder,
-    *,
-    consumer_name: str = "worker-test",
-    force_reclaim: bool = False,
-) -> list[QueueItem]:
-    """Drives the worker exactly one iteration (no background threads or
-    sleeps) using the real consumer-group mechanics (XREADGROUP /
-    XAUTOCLAIM) against the same Redis the API wrote to.
+async def process_queue(
+    worker_settings: WorkerSettings, encoder: Encoder, *, max_jobs: int = -1
+) -> None:
+    """Runs a real arq worker in burst mode: it exits once the queue is empty, including jobs
+    deferred for a retry. `max_jobs` stops it after that many job starts instead, which lets
+    a scenario look at the state between attempts. Real Redis, real arq polling; only the
+    process boundary and signal handling are left out.
     """
-    await ensure_consumer_group(
-        worker_redis, worker_settings.stream_key, worker_settings.consumer_group
+    worker = Worker(
+        **worker_kwargs(worker_settings, lambda: encoder, serve_metrics=False),
+        burst=True,
+        handle_signals=False,
+        max_burst_jobs=max_jobs,
     )
-    return await run_one_iteration(
-        worker_redis,
-        encoder,
-        worker_settings,
-        consumer_name=consumer_name,
-        force_reclaim=force_reclaim,
-    )
+    try:
+        await worker.async_run()
+    finally:
+        await worker.close()

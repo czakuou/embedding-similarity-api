@@ -73,7 +73,7 @@ run-worker:
 	REDIS_URL=redis://localhost:6379/0 \
 	MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2 \
 	MODEL_REVISION=1110a243fdf4706b3f48f1d95db1a4f5529b4d41 \
-	uv run python -m similarity.worker.main
+	uv run arq similarity.worker.entrypoint.ArqSettings
 
 compose-up:
 	docker compose up --build
