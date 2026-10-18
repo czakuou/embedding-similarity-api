@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Pinned by digest, not tag: reproducible builds (SPEC §11: model delivery).
+# Pinned by digest, not tag: reproducible builds.
 FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS base
 
 COPY --from=ghcr.io/astral-sh/uv@sha256:4faec156e35a5f345d57804d8858c6ba1cf6352ce5f4bffc11b7fdebdef46a38 /uv /uvx /usr/local/bin/
@@ -27,7 +27,12 @@ USER 1000:1000
 EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-CMD ["uvicorn", "similarity.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# API_CONCURRENCY_LIMIT (an ApiSettings field) has no runtime reader other than
+# this uvicorn flag, so it needs shell interpolation; hadolint's JSON-form
+# warning (DL3025) doesn't apply when CMD itself must expand an env var.
+# hadolint ignore=DL3025
+CMD uvicorn similarity.api:create_app --factory --host 0.0.0.0 --port 8000 \
+    --limit-concurrency "${API_CONCURRENCY_LIMIT:-200}"
 
 
 # ---- Worker image: CPU torch + sentence-transformers, model baked in ------
@@ -46,8 +51,8 @@ COPY src/ src/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --group worker --no-group dev
 
-# Baked in at build time (SPEC §11): no runtime dependency on Hugging Face,
-# reproducible across replicas. HF_HUB_OFFLINE=1 at runtime enforces this.
+# Baked in at build time: no runtime dependency on Hugging Face, reproducible
+# across replicas. HF_HUB_OFFLINE=1 at runtime enforces this.
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('${MODEL_NAME}', revision='${MODEL_REVISION}')"
