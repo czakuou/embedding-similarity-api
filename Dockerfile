@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-# Pinned by digest, not tag: reproducible builds.
 FROM python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f AS base
 
 COPY --from=ghcr.io/astral-sh/uv@sha256:4faec156e35a5f345d57804d8858c6ba1cf6352ce5f4bffc11b7fdebdef46a38 /uv /uvx /usr/local/bin/
