@@ -45,7 +45,11 @@ jobs:
         # pip-audit's --locked only understands PEP 751 pylock.toml, not uv's
         # native uv.lock format (verified by running it directly against
         # uv.lock, which fails with "no lockfiles found"); export first.
-        run: uv export --format requirements.txt --all-groups --no-emit-project -o requirements-audit.txt
+        # pip-audit resolves against PyPI only: the Linux lock pins torch to the
+        # pytorch-cpu index build (torch==X+cpu), which PyPI doesn't serve, and its
+        # hashes don't match PyPI's wheels. Drop the local version and the hashes;
+        # the advisories apply to the same upstream version either way.
+        run: uv export --format requirements.txt --all-groups --no-emit-project --no-hashes | sed 's/+cpu//' > requirements-audit.txt
 
       - name: pip-audit
         run: uv run pip-audit -r requirements-audit.txt

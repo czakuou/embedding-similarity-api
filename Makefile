@@ -60,7 +60,7 @@ pre-commit:
 	uv run pre-commit run --all-files
 
 audit:
-	uv export --format requirements.txt --all-groups --no-emit-project -o requirements-audit.txt
+	uv export --format requirements.txt --all-groups --no-emit-project --no-hashes | sed 's/+cpu//' > requirements-audit.txt
 	uv run pip-audit -r requirements-audit.txt
 
 # Local run targets assume Redis is reachable at localhost:6379 (e.g. `docker
